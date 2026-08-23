@@ -4,6 +4,7 @@
 #include <sys/mman.h>
 #include <errno.h>
 #include "ohv_internal.h"
+#include <cstdlib>
 #include "openhyp/ohv_trap.h"
 
 using namespace ohv;
@@ -135,7 +136,22 @@ extern "C" hv_return_t hv_vm_create(hv_vm_config_t config) {
         args.min_ipa = 0;
         args.ipa_size = bits ? (1ull << bits) : 0;
         args.granule = config ? config->granule : 0;
-        args.flags = 0;
+        /*
+         * The kernel learns about guest EL2 and VHE here or not at all: the
+         * config records them, and this is the only thing it sends.  Which
+         * bits carry them is not in the protocol notes, so they are named and
+         * overridable while that is being pinned down.
+         */
+        {
+            const char *e2 = getenv("OHV_EL2_FLAG");
+            const char *vh = getenv("OHV_VHE_FLAG");
+            uint32_t el2_bit = e2 ? (uint32_t)strtoul(e2, nullptr, 0) : 1u;
+            uint32_t vhe_bit = vh ? (uint32_t)strtoul(vh, nullptr, 0) : 2u;
+
+            args.flags = 0;
+            if (config && config->el2_enabled) args.flags |= el2_bit;
+            if (config && config->vhe_enabled) args.flags |= vhe_bit;
+        }
         args.isa = config ? config->isa : OHV_VM_ISA_APPLE;
         const char *dbg = getenv("OHV_DEBUG");
         if (dbg && *dbg) {

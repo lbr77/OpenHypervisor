@@ -243,7 +243,14 @@ static hv_return_t sysreg_access(hv_vcpu_t id, uint16_t enc, uint64_t *value, bo
         default: return HV_UNSUPPORTED;
     }
     volatile uint64_t *p = (volatile uint64_t *)(base + region + (uint64_t)d->index * 8);
-    if (d->sync_before && write) {
+    if (d->sync_before) {
+        /*
+         * Both directions, not just writes.  A read is where a stale mirror
+         * shows: the guarded bank is filled by the hardware on GENTER, and a
+         * read that skips the sync answers whatever the context happened to
+         * hold -- zero, where the return address should be.  Before a write
+         * it keeps the rest of the block from being carried back stale.
+         */
         hv_return_t r = ohv_raw_trap(OHV_TRAP_VCPU_SYSREGS_SYNC, nullptr);
         if (r != HV_SUCCESS) return r;
     }
