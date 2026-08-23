@@ -164,6 +164,35 @@ enum ohv_vm_isa {
     OHV_VM_ISA_INTERNAL           = 4,
 };
 
+// ------------------------------------------------- nested virtualisation --
+/*
+ * Guest EL2 is FEAT_NV.  The guest never reaches hardware EL2: it runs at EL1
+ * and is told it is at EL2 -- CurrentEL and the EL2 registers are answered for
+ * it, through the VNCR page with NV2 -- while PSTATE.M names EL1 throughout.
+ *
+ * These are also the three bits the framework tests before it accepts
+ * el2_enabled at all: it reads the mask of settable HCR_EL2 bits out of the
+ * capabilities and requires every one of them.
+ */
+#define OHV_HCR_NV                (1ull << 42)
+#define OHV_HCR_NV1               (1ull << 43)
+#define OHV_HCR_NV2               (1ull << 45)
+#define OHV_HCR_E2H               (1ull << 34)
+/*
+ * NV and NV2, and deliberately not NV1.  All three have to be *settable* for
+ * nesting to be available -- that is the capability the framework tests -- but
+ * only these two are set to run a guest hypervisor.  NV1 changes what the EL1
+ * translation regime means, and with it on the register redirection the guest
+ * depends on does not happen: the first access to an EL2 register faults
+ * instead of landing in the VNCR page.  Measured against the framework, which
+ * runs its guest hypervisor with 0x2400000000000 of these three.
+ */
+#define OHV_HCR_NESTED            (OHV_HCR_NV | OHV_HCR_NV2)
+
+/* The settable-HCR mask inside what trap 0 copies out
+ * (Arm::HypervisorCapabilities::get_control_hcr reads it at this offset). */
+#define OHV_CAPS_CONTROL_HCR_OFF  0x40
+
 // ----------------------------------------------------------- vmexit info --
 // Kernel-side exit classification, found in the read-only context page.
 enum ohv_vmexit_reason {

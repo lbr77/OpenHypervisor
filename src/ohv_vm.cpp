@@ -4,8 +4,16 @@
 #include <sys/mman.h>
 #include <errno.h>
 #include "ohv_internal.h"
+#include <cstring>
 #include <cstdlib>
 #include "openhyp/ohv_trap.h"
+
+namespace {
+const unsigned kNestedSpaces = 8;   /* what the framework asks for */
+uint64_t g_nested_asid[kNestedSpaces];
+unsigned g_nested_count;
+}  // namespace
+
 
 using namespace ohv;
 
@@ -126,11 +134,6 @@ extern "C" hv_return_t hv_vm_config_set_ipa_granule(hv_vm_config_t c, hv_ipa_gra
 }
 
 // -------------------------------------------------------------- lifecycle --
-namespace {
-const unsigned kNestedSpaces = 8;   /* what the framework asks for */
-uint64_t g_nested_asid[kNestedSpaces];
-unsigned g_nested_count;
-}  // namespace
 
 /*
  * The address spaces a guest hypervisor needs before it can exist.
@@ -237,6 +240,7 @@ extern "C" hv_return_t hv_vm_get_max_vcpu_count(uint32_t *max) {
 }
 
 // ---------------------------------------------------------------- memory --
+
 static hv_return_t map_op(int trap, void *uva, hv_ipa_t ipa, size_t size, hv_memory_flags_t flags) {
     pthread_mutex_lock(&g_vm_mutex);
     hv_return_t r = require_vm();
@@ -251,6 +255,25 @@ static hv_return_t map_op(int trap, void *uva, hv_ipa_t ipa, size_t size, hv_mem
             ohv_vm_map_item_t item{ (uint64_t)(uintptr_t)uva, ipa, size, flags, 0 };
             r = ohv_raw_trap((unsigned)trap, &item);
             if (mdbg && *mdbg) fprintf(stderr, "[ohv]   -> %d\n", r);
+            /*
+             * A guest hypervisor runs in one of the nested address spaces, and
+             * a space with nothing in it cannot fetch an instruction.  Put the
+             * same memory in each of them, so a vCPU is not left choosing
+             * between an address space that describes its guest and one the
+             * kernel will accept.
+             */
+            if (r == HV_SUCCESS && g_vm_el2) {
+                for (unsigned i = 0; i < g_nested_count; i++) {
+                    ohv_vm_map_item_t in_space{ (uint64_t)(uintptr_t)uva, ipa,
+                                                size, flags, g_nested_asid[i] };
+                    hv_return_t sr = ohv_raw_trap((unsigned)trap, &in_space);
+
+                    if (sr != HV_SUCCESS && mdbg && *mdbg) {
+                        fprintf(stderr, "[ohv]   space %llx -> %d\n",
+                                (unsigned long long)g_nested_asid[i], sr);
+                    }
+                }
+            }
         }
     }
     pthread_mutex_unlock(&g_vm_mutex);

@@ -1,6 +1,7 @@
 // ohv_vcpu.cpp - vCPU lifecycle, register access, run loop glue.
 #include <mach/mach_time.h>
 #include "ohv_internal.h"
+#include <cstdlib>
 #include <cstdio>
 #include "openhyp/ohv_trap.h"
 
@@ -140,6 +141,26 @@ extern "C" hv_return_t hv_vcpu_create(hv_vcpu_t *vcpu_out, hv_vcpu_exit_t **exit
     s.id = id;
     s.owner = pthread_self();
     s.run_count = 0;
+    if (ohv::g_vm_el2) {
+        /*
+         * Turn the guest into a guest hypervisor: NV, NV1 and NV2 in its
+         * HCR_EL2, plus E2H when it is to see the host-extension form.  These
+         * are what make an EL1 guest believe it is at EL2; without them the
+         * kernel has an ordinary EL1 guest and refuses anything else.
+         */
+        volatile uint64_t *controls = (volatile uint64_t *)ohv_rw_controls(s.ctx);
+        const char *mask = getenv("OHV_HCR_NESTED_MASK");
+        uint64_t hcr = controls[0] |
+            (mask ? strtoull(mask, nullptr, 0) : OHV_HCR_NESTED);
+
+        if (ohv::g_vm_vhe) {
+            hcr |= OHV_HCR_E2H;
+        } else {
+            hcr &= ~OHV_HCR_E2H;
+        }
+        controls[0] = hcr;
+        mark_dirty(s.ctx, OHV_STATE_CONTROLS);
+    }
     tl_current_vcpu = &s;
 
     /*
@@ -148,7 +169,7 @@ extern "C" hv_return_t hv_vcpu_create(hv_vcpu_t *vcpu_out, hv_vcpu_exit_t **exit
      * same trap.  Without it the kernel has nowhere to put guest EL2 and
      * refuses the first run as illegal guest state.
      */
-    if (ohv::g_vm_el2) {
+    if (ohv::g_vm_el2 && !getenv("OHV_NO_NESTED_SPACE")) {
         uint64_t asid = ohv_nested_asid(0);
 
         if (asid) {
@@ -209,7 +230,28 @@ extern "C" hv_return_t hv_vcpu_set_reg(hv_vcpu_t id, hv_reg_t reg, uint64_t valu
     if (!s) return HV_BAD_ARGUMENT;
     ohv_rw_page_head_t *rw = ohv_rw(s->ctx);
     switch (reg) {
-        case HV_REG_CPSR: rw->regs.cpsr = (uint32_t)value; break;
+        case HV_REG_CPSR: {
+            /*
+             * A guest hypervisor does not run at hardware EL2, so PSTATE must
+             * not say EL2.  A caller describes its guest the way the guest
+             * sees itself and hands us EL2h; writing that through asks the
+             * kernel to return into a level the guest does not have, which it
+             * refuses as illegal guest state.  Translate the level and leave
+             * the rest alone -- the framework does the same, visibly: give it
+             * EL2h and its context reads back EL1h.
+             */
+            uint32_t pstate = (uint32_t)value;
+
+            if (ohv::g_vm_el2) {
+                uint32_t mode = pstate & 0xf;
+
+                if (mode == 0x8 || mode == 0x9) {   /* EL2t, EL2h */
+                    pstate = (pstate & ~0xfu) | (mode - 4);
+                }
+            }
+            rw->regs.cpsr = pstate;
+            break;
+        }
         case HV_REG_FPCR: rw->neon.fpcr = (uint32_t)value; break;
         case HV_REG_FPSR: rw->neon.fpsr = (uint32_t)value; break;
         default: {
