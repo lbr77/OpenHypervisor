@@ -126,6 +126,48 @@ extern "C" hv_return_t hv_vm_config_set_ipa_granule(hv_vm_config_t c, hv_ipa_gra
 }
 
 // -------------------------------------------------------------- lifecycle --
+namespace {
+const unsigned kNestedSpaces = 8;   /* what the framework asks for */
+uint64_t g_nested_asid[kNestedSpaces];
+unsigned g_nested_count;
+}  // namespace
+
+/*
+ * The address spaces a guest hypervisor needs before it can exist.
+ *
+ * Guest EL2 is not something the VM-create request carries -- the framework
+ * sends flags = 0 there too.  What it does instead, in Hv::Vm::Vm, is notice
+ * el2_enabled and stand up a GuestHypervisorSpaceManager, which creates eight
+ * nested address spaces through the address-space trap and hands their ASIDs
+ * to a NestedGuestMemoryMap.  Without them the kernel has nothing to run a
+ * guest hypervisor in, and refuses a vCPU entering EL2h as illegal guest
+ * state.
+ *
+ * The request it sends is the constant pair at 0x21b3f4948: min_ipa 0,
+ * ipa_size 0, granule 0x1000, flags 0, with the ASID read back out.
+ */
+static void nested_spaces_create(void) {
+    for (unsigned i = 0; i < kNestedSpaces; i++) {
+        ohv_vm_addrspace_create_t a{};
+
+        a.granule = 0x1000;
+        hv_return_t r = ohv_raw_trap(OHV_TRAP_VM_ADDRESS_SPACE_CREATE, &a);
+
+        if (r != HV_SUCCESS) {
+            /*
+             * Say so.  A guest hypervisor with no address spaces is refused
+             * later, at the first run, as illegal guest state -- which says
+             * nothing about the space that could not be made here.
+             */
+            fprintf(stderr, "[ohv] nested address space %u refused (%#x)\n", i, r);
+            break;
+        }
+        if (g_nested_count < kNestedSpaces) {
+            g_nested_asid[g_nested_count++] = a.out_asid;
+        }
+    }
+}
+
 extern "C" hv_return_t hv_vm_create(hv_vm_config_t config) {
     pthread_mutex_lock(&g_vm_mutex);
     hv_return_t r = HV_SUCCESS;
@@ -137,21 +179,13 @@ extern "C" hv_return_t hv_vm_create(hv_vm_config_t config) {
         args.ipa_size = bits ? (1ull << bits) : 0;
         args.granule = config ? config->granule : 0;
         /*
-         * The kernel learns about guest EL2 and VHE here or not at all: the
-         * config records them, and this is the only thing it sends.  Which
-         * bits carry them is not in the protocol notes, so they are named and
-         * overridable while that is being pinned down.
+         * Flags are zero, which is what the framework sends too: Hv::Vm::create
+         * builds {min_ipa, ipa_size, granule@16, flags@20 = 0, isa@24} and
+         * leaves it at that.  Guest EL2 and VHE are not part of this request --
+         * it keeps them in its own Vm object and carries them further down --
+         * so there is nothing to look for here.
          */
-        {
-            const char *e2 = getenv("OHV_EL2_FLAG");
-            const char *vh = getenv("OHV_VHE_FLAG");
-            uint32_t el2_bit = e2 ? (uint32_t)strtoul(e2, nullptr, 0) : 1u;
-            uint32_t vhe_bit = vh ? (uint32_t)strtoul(vh, nullptr, 0) : 2u;
-
-            args.flags = 0;
-            if (config && config->el2_enabled) args.flags |= el2_bit;
-            if (config && config->vhe_enabled) args.flags |= vhe_bit;
-        }
+        args.flags = 0;
         args.isa = config ? config->isa : OHV_VM_ISA_APPLE;
         const char *dbg = getenv("OHV_DEBUG");
         if (dbg && *dbg) {
@@ -166,6 +200,9 @@ extern "C" hv_return_t hv_vm_create(hv_vm_config_t config) {
             g_vm_isa = args.isa;
             g_vm_el2 = config && config->el2_enabled;
             g_vm_vhe = config && config->vhe_enabled;
+            if (g_vm_el2) {
+                nested_spaces_create();
+            }
         }
     } while (0);
     pthread_mutex_unlock(&g_vm_mutex);
