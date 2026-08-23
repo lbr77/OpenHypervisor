@@ -210,12 +210,21 @@ typedef struct {
 
 // Anchors from the framework binary (see PROTOCOL.md §2):
 // Binary-verified anchors (framework internals, PROTOCOL.md section 2):
-#define OHV_RW_REGS_X0          0x000
-#define OHV_RW_FP               0x0e8
-#define OHV_RW_LR               0x0f0
-#define OHV_RW_SP               0x0f8
-#define OHV_RW_PC               0x100
-#define OHV_RW_CPSR             0x108
+/*
+ * The register block starts one word into the page.  Measured against a live
+ * vCPU: X11 reads back at +0x060 (so X0 is at +0x008), PC at +0x108 and
+ * PSTATE at +0x110 -- the same frame the ext-register anchors below were
+ * written against.  The kernel takes PC from +0x108, so with the old offsets
+ * a vCPU never received an entry point and no guest executed an instruction;
+ * the smoke test passed by reading its own misplaced write back.
+ */
+#define OHV_RW_HEAD             0x000
+#define OHV_RW_REGS_X0          0x008
+#define OHV_RW_FP               0x0f0
+#define OHV_RW_LR               0x0f8
+#define OHV_RW_SP               0x100
+#define OHV_RW_PC               0x108
+#define OHV_RW_CPSR             0x110
 #define OHV_RW_NEON_Q0          0x140
 #define OHV_RW_FPSR             0x340
 #define OHV_RW_FPCR             0x344
@@ -277,16 +286,17 @@ enum {
 
 // Typed views over the raw mapped pages.
 typedef struct {
+    uint64_t __head;         // 0x000, ahead of the register block
     struct {
-        uint64_t x[29];      // x0 @ 0x000 .. x28 @ 0xe0
-        uint64_t fp;         // 0xe8
-        uint64_t lr;         // 0xf0
-        uint64_t sp;         // 0xf8
-        uint64_t pc;         // 0x100
-        uint32_t cpsr;       // 0x108
+        uint64_t x[29];      // x0 @ 0x008 .. x28 @ 0x0e8
+        uint64_t fp;         // 0x0f0
+        uint64_t lr;         // 0x0f8
+        uint64_t sp;         // 0x100
+        uint64_t pc;         // 0x108
+        uint32_t cpsr;       // 0x110
         uint32_t pad;
     } regs;
-    uint8_t __pad_to_neon[OHV_RW_NEON_Q0 - 0x110];
+    uint8_t __pad_to_neon[OHV_RW_NEON_Q0 - 0x118];
     struct {
         __uint128_t q[32];   // 0x140 .. 0x33f
         uint32_t fpsr;       // 0x340

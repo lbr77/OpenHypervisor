@@ -63,6 +63,12 @@ struct SysRegDesc {
     bool sync_before;   // issue TRAP_HV_VCPU_SYSREGS_SYNC before access
 };
 const SysRegDesc *sysreg_lookup(uint16_t encoding);
+/* The Apple private encodings, which the generator has no source for. */
+const SysRegDesc *sysreg_lookup_apple(uint16_t encoding);
 
 } // namespace ohv
+void *ohv_guest_ptr(uint64_t ipa, uint64_t len);
+/* The nested address spaces a guest hypervisor runs in, if any. */
+uint64_t ohv_nested_asid(unsigned index);
+
 #endif

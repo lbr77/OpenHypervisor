@@ -7,21 +7,18 @@ using namespace ohv;
 
 // ------------------------------------------------------------------ caps --
 struct CapsEntry { uint16_t enc; size_t off; };
-// Offsets measured from the framework's own getters over its
-// hypervisor_capabilities buffer (the 475-byte macOS 27 layout -- the
-// open-source header order does not apply).
 static const CapsEntry kCapsMap[] = {
-    {HV_SYS_REG_ID_AA64DFR0_EL1,  0x148},
-    {HV_SYS_REG_ID_AA64DFR1_EL1,  0x150},
-    {HV_SYS_REG_ID_AA64ISAR0_EL1, 0x158},
-    {HV_SYS_REG_ID_AA64ISAR1_EL1, 0x160},
-    {HV_SYS_REG_ID_AA64MMFR0_EL1, 0x168},
-    {HV_SYS_REG_ID_AA64MMFR1_EL1, 0x170},
-    {HV_SYS_REG_ID_AA64MMFR2_EL1, 0x178},
-    {HV_SYS_REG_ID_AA64PFR0_EL1,  0x180},
-    {HV_SYS_REG_ID_AA64PFR1_EL1,  0x188},
-    {0xc025 /* ID_AA64SMFR0_EL1 */, 0x190},
-    {0xc024 /* ID_AA64ZFR0_EL1 */,  0x198},
+#define CAP_OFF(fld) offsetof(ohv_capabilities_t, fld)
+    {HV_SYS_REG_ID_AA64DFR0_EL1, CAP_OFF(id_aa64dfr0_el1)},
+    {HV_SYS_REG_ID_AA64DFR1_EL1, CAP_OFF(id_aa64dfr1_el1)},
+    {HV_SYS_REG_ID_AA64ISAR0_EL1, CAP_OFF(id_aa64isar0_el1)},
+    {HV_SYS_REG_ID_AA64ISAR1_EL1, CAP_OFF(id_aa64isar1_el1)},
+    {HV_SYS_REG_ID_AA64MMFR0_EL1, CAP_OFF(id_aa64mmfr0_el1)},
+    {HV_SYS_REG_ID_AA64MMFR1_EL1, CAP_OFF(id_aa64mmfr1_el1)},
+    {HV_SYS_REG_ID_AA64MMFR2_EL1, CAP_OFF(id_aa64mmfr2_el1)},
+    {HV_SYS_REG_ID_AA64PFR0_EL1, CAP_OFF(id_aa64pfr0_el1)},
+    {HV_SYS_REG_ID_AA64PFR1_EL1, CAP_OFF(id_aa64pfr1_el1)},
+#undef CAP_OFF
 };
 extern "C" uint64_t ohv_caps_field(const ohv_capabilities_t *c, uint16_t enc) {
     // Serve read-only id registers from the kernel capabilities snapshot.

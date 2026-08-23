@@ -20,8 +20,12 @@ struct hv_gic_config_s {
 
 // GICv3 constants (public ARM architecture values).
 static const size_t kDistSize        = 0x10000;
-static const size_t kRedistRegion    = 2 * 0x20000; // RD_base + SGI_base per cpu
-static const size_t kRedistSize      = 0x20000;
+static const size_t kRedistSize      = 0x20000;  // RD_base + SGI_base, per cpu
+static const size_t kMaxCpus         = 64;      // as wide as the tables below
+// The region has to hold a redistributor for every vCPU the VM can have,
+// which is what a caller places its other devices around.  Reporting two
+// cpus' worth while modelling sixty-four understates it by a factor of 32.
+static const size_t kRedistRegion    = kMaxCpus * kRedistSize;
 static const size_t kMsiRegionSize   = 0x10000;
 static const uint32_t kSpiBase       = 32;
 static const uint32_t kSpiCount      = 992 - 32 + 1;
@@ -57,11 +61,12 @@ extern "C" hv_return_t hv_gic_create(hv_gic_config_t config) {
     pthread_mutex_lock(&g_vm_mutex);
     hv_return_t r = require_vm();
     if (r != HV_SUCCESS) { pthread_mutex_unlock(&g_vm_mutex); return HV_NO_DEVICE; }
-    if (!g_vm_alive || g_vcpus[0].used == false) {
-        // framework requires at least one vcpu before creating the gic
-        bool any = false;
-        for (auto &s : ohv::g_vcpus) any = any || s.used;
-        if (!any) { pthread_mutex_unlock(&g_vm_mutex); return HV_NO_DEVICE; }
+    // The GIC is created after the VM and *before* any vCPU, so that the CPU
+    // system resources can be allocated as each vCPU comes up; hv_gic.h says
+    // so and the framework enforces it.  Requiring a vCPU first had it exactly
+    // backwards, and refused every caller that follows the documented order.
+    for (auto &v : ohv::g_vcpus) {
+        if (v.used) { pthread_mutex_unlock(&g_vm_mutex); return HV_BUSY; }
     }
     if (g_gic) { pthread_mutex_unlock(&g_vm_mutex); return HV_BUSY; }
     GicModel *m = new GicModel{};
@@ -144,12 +149,12 @@ extern "C" hv_return_t hv_gic_set_ich_reg(hv_vcpu_t id, hv_gic_ich_reg_t reg, ui
     if (!m || !s) return HV_NO_DEVICE;
     if ((unsigned)reg >= GIC_ICH_REG_COUNT) return HV_BAD_ARGUMENT;
     m->ich[s->id][(unsigned)reg] = value;
-    // Mirror list registers into the controls block (kernel order:
-    // ich_hcr at +0x88, the eight LRs after it).
+    // Mirror list registers into the context so the next run picks them up.
     if ((unsigned)reg < 8)
-        *ohv_rw_u64(s->ctx, OHV_RW_CONTROLS + 0x90 + (unsigned)reg * 8) = value;
+        ohv_rw_controls(s->ctx)->ich_lr_el2[(unsigned)reg] =
+            value | (((uint64_t)(reg)) << 32 ? 0 : 0);
     else
-        *ohv_rw_u64(s->ctx, OHV_RW_CONTROLS + 0x88) = value;
+        ohv_rw_controls(s->ctx)->ich_hcr_el2 = value;
     mark_dirty(s->ctx, OHV_STATE_GIC | OHV_STATE_CONTROLS);
     return HV_SUCCESS;
 }

@@ -1,6 +1,8 @@
 // ohv_vcpu.cpp - vCPU lifecycle, register access, run loop glue.
 #include <mach/mach_time.h>
 #include "ohv_internal.h"
+#include <cstdlib>
+#include <cstdio>
 #include "openhyp/ohv_trap.h"
 
 using namespace ohv;
@@ -57,13 +59,69 @@ static void exit_from_ro(VcpuSlot *s) {
                 out->reason = HV_EXIT_REASON_EXCEPTION;
             break;
         }
+        case OHV_VMEXIT_MSR_TRAP: {
+            /*
+             * The kernel says a system register access trapped and stops
+             * there: no syndrome, no opcode, and nothing about it anywhere in
+             * the shared pages.  A VMM cannot answer an access it cannot
+             * name, so read the instruction the guest is sitting on and build
+             * the syndrome the exception class is defined to carry.
+             *
+             * PC is a virtual address in general; this reaches it as a guest
+             * physical one, which is right while the guest MMU is off and is
+             * where a monitor being brought up spends its first instructions.
+             * With translation on there is a stage-1 walk to do first, and
+             * until that exists the syndrome stays zero rather than wrong.
+             */
+            uint64_t pc = ohv_rw(s->ctx)->regs.pc;
+            const uint32_t *insn = (const uint32_t *)ohv_guest_ptr(pc, 4);
+
+            out->reason = HV_EXIT_REASON_EXCEPTION;
+            if (insn && (*insn & 0xffd00000u) == 0xd5100000u) {
+                uint32_t i = *insn;
+                uint32_t read = (i >> 21) & 1;
+                uint32_t op0 = 2 + ((i >> 19) & 1);
+                uint32_t op1 = (i >> 16) & 7;
+                uint32_t crn = (i >> 12) & 0xf;
+                uint32_t crm = (i >> 8) & 0xf;
+                uint32_t op2 = (i >> 5) & 7;
+                uint32_t rt = i & 0x1f;
+
+                out->exception.syndrome =
+                    (0x18ull << 26) | (1ull << 25) |
+                    (op0 << 20) | (op2 << 17) | (op1 << 14) |
+                    (crn << 10) | (rt << 5) | (crm << 1) | read;
+            }
+            break;
+        }
         case OHV_VMEXIT_SYNC:
+            /*
+             * A guarded exit arrives as a plain synchronous exit with no
+             * syndrome: the kernel does not perform GEXIT for a guest at EL2
+             * and does not describe it either.  The framework answers its
+             * caller with EC 0x3f, and a VMM that has to complete the guarded
+             * return needs to be told which exit this is -- so read the
+             * instruction the guest stopped on and say so.
+             *
+             * Only a guest actually in guarded state can execute it; outside
+             * guarded state the same encoding is undefined, which is how the
+             * exception class earns its meaning.
+             */
+            if (e->vmexit_esr == 0) {
+                uint64_t pc = ohv_rw(s->ctx)->regs.pc;
+                const uint32_t *insn = (const uint32_t *)ohv_guest_ptr(pc, 4);
+
+                if (insn && *insn == 0x00201400u) {   /* GEXIT */
+                    out->exception.syndrome =
+                        (0x3full << 26) | (1ull << 25) | 0x22;
+                }
+            }
+            /* fall through */
         case OHV_VMEXIT_SERROR:
         case OHV_VMEXIT_IRQ:
         case OHV_VMEXIT_FIQ:
         case OHV_VMEXIT_UNHANDLED_FAULT:
         case OHV_VMEXIT_UNKNOWN_TRAP:
-        case OHV_VMEXIT_MSR_TRAP:
         case OHV_VMEXIT_ILLEGAL_ERET:
         case OHV_VMEXIT_VGIC:
         case OHV_VMEXIT_SME_TRAP:
@@ -105,7 +163,48 @@ extern "C" hv_return_t hv_vcpu_create(hv_vcpu_t *vcpu_out, hv_vcpu_exit_t **exit
     s.id = id;
     s.owner = pthread_self();
     s.run_count = 0;
+    if (ohv::g_vm_el2) {
+        /*
+         * Turn the guest into a guest hypervisor: NV, NV1 and NV2 in its
+         * HCR_EL2, plus E2H when it is to see the host-extension form.  These
+         * are what make an EL1 guest believe it is at EL2; without them the
+         * kernel has an ordinary EL1 guest and refuses anything else.
+         */
+        volatile uint64_t *controls = (volatile uint64_t *)ohv_rw_controls(s.ctx);
+        const char *mask = getenv("OHV_HCR_NESTED_MASK");
+        uint64_t hcr = controls[0] |
+            (mask ? strtoull(mask, nullptr, 0) : OHV_HCR_NESTED);
+
+        if (ohv::g_vm_vhe) {
+            hcr |= OHV_HCR_E2H;
+        } else {
+            hcr &= ~OHV_HCR_E2H;
+        }
+        controls[0] = hcr;
+        mark_dirty(s.ctx, OHV_STATE_CONTROLS);
+    }
     tl_current_vcpu = &s;
+
+    /*
+     * A vCPU that will run a guest hypervisor has to be in one of the nested
+     * address spaces the VM stood up; the framework assigns one through the
+     * same trap.  Without it the kernel has nowhere to put guest EL2 and
+     * refuses the first run as illegal guest state.
+     */
+    if (ohv::g_vm_el2 && !getenv("OHV_NO_NESTED_SPACE")) {
+        uint64_t asid = ohv_nested_asid(0);
+
+        if (asid) {
+            hv_return_t sr = ohv_raw_trap(OHV_TRAP_VCPU_SET_ADDRESS_SPACE,
+                                          (void *)(uintptr_t)asid);
+
+            if (sr != HV_SUCCESS) {
+                fprintf(stderr, "[ohv] vcpu could not join nested space"
+                                " %#llx (%#x)\n",
+                        (unsigned long long)asid, sr);
+            }
+        }
+    }
     *vcpu_out = id;
     *exit = &s.pub_exit;
     pthread_mutex_unlock(&g_vcpus_mutex);
@@ -153,7 +252,28 @@ extern "C" hv_return_t hv_vcpu_set_reg(hv_vcpu_t id, hv_reg_t reg, uint64_t valu
     if (!s) return HV_BAD_ARGUMENT;
     ohv_rw_page_head_t *rw = ohv_rw(s->ctx);
     switch (reg) {
-        case HV_REG_CPSR: rw->regs.cpsr = (uint32_t)value; break;
+        case HV_REG_CPSR: {
+            /*
+             * A guest hypervisor does not run at hardware EL2, so PSTATE must
+             * not say EL2.  A caller describes its guest the way the guest
+             * sees itself and hands us EL2h; writing that through asks the
+             * kernel to return into a level the guest does not have, which it
+             * refuses as illegal guest state.  Translate the level and leave
+             * the rest alone -- the framework does the same, visibly: give it
+             * EL2h and its context reads back EL1h.
+             */
+            uint32_t pstate = (uint32_t)value;
+
+            if (ohv::g_vm_el2) {
+                uint32_t mode = pstate & 0xf;
+
+                if (mode == 0x8 || mode == 0x9) {   /* EL2t, EL2h */
+                    pstate = (pstate & ~0xfu) | (mode - 4);
+                }
+            }
+            rw->regs.cpsr = pstate;
+            break;
+        }
         case HV_REG_FPCR: rw->neon.fpcr = (uint32_t)value; break;
         case HV_REG_FPSR: rw->neon.fpsr = (uint32_t)value; break;
         default: {
@@ -209,7 +329,14 @@ static hv_return_t sysreg_access(hv_vcpu_t id, uint16_t enc, uint64_t *value, bo
         default: return HV_UNSUPPORTED;
     }
     volatile uint64_t *p = (volatile uint64_t *)(base + region + (uint64_t)d->index * 8);
-    if (d->sync_before && write) {
+    if (d->sync_before) {
+        /*
+         * Both directions, not just writes.  A read is where a stale mirror
+         * shows: the guarded bank is filled by the hardware on GENTER, and a
+         * read that skips the sync answers whatever the context happened to
+         * hold -- zero, where the return address should be.  Before a write
+         * it keeps the rest of the block from being carried back stale.
+         */
         hv_return_t r = ohv_raw_trap(OHV_TRAP_VCPU_SYSREGS_SYNC, nullptr);
         if (r != HV_SUCCESS) return r;
     }
@@ -254,24 +381,24 @@ extern "C" hv_return_t hv_vcpu_set_pending_interrupt(hv_vcpu_t, hv_interrupt_typ
 
 extern "C" hv_return_t hv_vcpu_get_trap_debug_exceptions(hv_vcpu_t id, bool *v) {
     VcpuSlot *s = owned_vcpu(id); if (!s || !v) return HV_BAD_ARGUMENT;
-    *v = (*ohv_rw_u64(s->ctx, OHV_RW_CONTROLS + 0x20) >> 14) & 1; // mdcr via ctrl map idx3
+    *v = (ohv_rw_controls(s->ctx)->mdcr_el2 >> 14) & 1; // MDCR_EL2.TDE
     return HV_SUCCESS;
 }
 extern "C" hv_return_t hv_vcpu_set_trap_debug_exceptions(hv_vcpu_t id, bool on) {
     VcpuSlot *s = owned_vcpu(id); if (!s) return HV_BAD_ARGUMENT;
-    volatile uint64_t *mdcr = ohv_rw_u64(s->ctx, OHV_RW_CONTROLS + 0x20);
+    volatile uint64_t *mdcr = &ohv_rw_controls(s->ctx)->mdcr_el2;
     *mdcr = on ? (*mdcr | (1ull << 14)) : (*mdcr & ~(1ull << 14));
     mark_dirty(s->ctx, OHV_STATE_CONTROLS);
     return HV_SUCCESS;
 }
 extern "C" hv_return_t hv_vcpu_get_trap_debug_reg_accesses(hv_vcpu_t id, bool *v) {
     VcpuSlot *s = owned_vcpu(id); if (!s || !v) return HV_BAD_ARGUMENT;
-    *v = (*ohv_rw_u64(s->ctx, OHV_RW_CONTROLS + 0x20) >> 9) & 1; // TDA|TDOSA|TDRA collapsed
+    *v = (ohv_rw_controls(s->ctx)->mdcr_el2 >> 9) & 1; // TDA|TDOSA|TDRA collapsed
     return HV_SUCCESS;
 }
 extern "C" hv_return_t hv_vcpu_set_trap_debug_reg_accesses(hv_vcpu_t id, bool on) {
     VcpuSlot *s = owned_vcpu(id); if (!s) return HV_BAD_ARGUMENT;
-    volatile uint64_t *mdcr = ohv_rw_u64(s->ctx, OHV_RW_CONTROLS + 0x20);
+    volatile uint64_t *mdcr = &ohv_rw_controls(s->ctx)->mdcr_el2;
     const uint64_t mask = (1ull << 9) | (1ull << 10) | (1ull << 12);
     *mdcr = on ? (*mdcr | mask) : (*mdcr & ~mask);
     mark_dirty(s->ctx, OHV_STATE_CONTROLS);
@@ -291,24 +418,24 @@ extern "C" hv_return_t hv_vcpu_get_wait_for_interrupt_time(hv_vcpu_t id, uint64_
 
 extern "C" hv_return_t hv_vcpu_get_vtimer_mask(hv_vcpu_t id, bool *masked) {
     VcpuSlot *s = owned_vcpu(id); if (!s || !masked) return HV_BAD_ARGUMENT;
-    *masked = (*ohv_rw_u64(s->ctx, OHV_RW_TIMER) & OHV_TIMER_MASK) != 0;
+    *masked = (ohv_rw_controls(s->ctx)->timer & OHV_TIMER_MASK) != 0;
     return HV_SUCCESS;
 }
 extern "C" hv_return_t hv_vcpu_set_vtimer_mask(hv_vcpu_t id, bool masked) {
     VcpuSlot *s = owned_vcpu(id); if (!s) return HV_BAD_ARGUMENT;
-    volatile uint64_t *t = ohv_rw_u64(s->ctx, OHV_RW_TIMER);
+    volatile uint64_t *t = &ohv_rw_controls(s->ctx)->timer;
     *t = masked ? (*t | OHV_TIMER_MASK) : (*t & ~OHV_TIMER_MASK);
     mark_dirty(s->ctx, OHV_STATE_CONTROLS);
     return HV_SUCCESS;
 }
 extern "C" hv_return_t hv_vcpu_get_vtimer_offset(hv_vcpu_t id, uint64_t *off) {
     VcpuSlot *s = owned_vcpu(id); if (!s || !off) return HV_BAD_ARGUMENT;
-    *off = *ohv_rw_u64(s->ctx, OHV_RW_VTIMER_OFFSET);
+    *off = ohv_rw_controls(s->ctx)->virtual_timer_offset;
     return HV_SUCCESS;
 }
 extern "C" hv_return_t hv_vcpu_set_vtimer_offset(hv_vcpu_t id, uint64_t off) {
     VcpuSlot *s = owned_vcpu(id); if (!s) return HV_BAD_ARGUMENT;
-    *ohv_rw_u64(s->ctx, OHV_RW_VTIMER_OFFSET) = off;
+    ohv_rw_controls(s->ctx)->virtual_timer_offset = off;
     mark_dirty(s->ctx, OHV_STATE_CONTROLS);
     return HV_SUCCESS;
 }
@@ -343,25 +470,12 @@ extern "C" hv_return_t hv_vcpus_exit(hv_vcpu_t *vcpus, uint32_t count) {
 }
 
 // -------------------------------------------------- private control/ext API --
-/*
- * Apple's public control-field index -> offset from the controls base, and
- * the validity mask the framework applies (0x3FBEF: 9 and 15 invalid), both
- * lifted from Hv::Vcpu::get/set_control_field.  The order is the framework's
- * own and does not follow the kernel's member sequence.
- */
-static const uint64_t kCtrlMap[18] = {
-    0x00, 0x10, 0x18, 0x20, 0x00 /*invalid*/, 0x28, 0x08,
-    0x70, 0x78, 0x80, 0x00 /*invalid*/, 0x38, 0x40,
-    0x48 /*invalid*/, 0x50, 0x58, 0x60, 0xd0,
-};
-#define OHV_CTRL_VALID_MASK 0x3fbefull
-
 static hv_return_t control_field_access(hv_vcpu_t id, _hv_control_field_t f, uint64_t *v, bool w) {
     VcpuSlot *s = owned_vcpu(id); if (!s || !v) return HV_BAD_ARGUMENT;
-    if ((unsigned)f >= 18 || !((OHV_CTRL_VALID_MASK >> f) & 1)) return HV_BAD_ARGUMENT;
-    volatile uint64_t *c = (volatile uint64_t *)((uint8_t *)s->ctx + OHV_RW_CONTROLS);
-    if (w) { c[kCtrlMap[f] / 8] = *v; mark_dirty(s->ctx, OHV_STATE_CONTROLS); }
-    else *v = c[kCtrlMap[f] / 8];
+    if ((unsigned)f >= sizeof(ohv_controls_t) / 8) return HV_BAD_ARGUMENT;
+    volatile uint64_t *c = (volatile uint64_t *)ohv_rw_controls(s->ctx);
+    if (w) { c[f] = *v; mark_dirty(s->ctx, OHV_STATE_CONTROLS); }
+    else *v = c[f];
     return HV_SUCCESS;
 }
 extern "C" hv_return_t __hv_vcpu_get_control_field(hv_vcpu_t id, _hv_control_field_t f, uint64_t *v) {
@@ -374,6 +488,37 @@ extern "C" hv_return_t __hv_vcpu_get_context(hv_vcpu_t id, void **context) {
     VcpuSlot *s = owned_vcpu(id); if (!s || !context) return HV_BAD_ARGUMENT;
     *context = s->ctx; return HV_SUCCESS;
 }
+/*
+ * The same private surface under the names Apple actually exports.
+ *
+ * Every consumer of this surface reaches it with dlsym("_hv_..."), because
+ * the symbols are not in any SDK header -- QEMU's HVF backend does exactly
+ * that.  Exporting only the two-underscore spelling means those lookups
+ * return null and the caller carries on with the feature quietly disabled:
+ * control fields are never written, so the traps they enable never arrive,
+ * and the context is never read.  Nothing reports an error, which is the
+ * worst shape a missing symbol can take.
+ *
+ * _hv_vcpu_get_context also has a different shape there: it answers with the
+ * pointer rather than writing it through an out-parameter.
+ */
+extern "C" void *_hv_vcpu_get_context(hv_vcpu_t id) {
+    VcpuSlot *s = owned_vcpu(id);
+    return s ? s->ctx : nullptr;
+}
+
+extern "C" hv_return_t _hv_vcpu_get_control_field(hv_vcpu_t id,
+                                                 _hv_control_field_t f,
+                                                 uint64_t *v) {
+    return control_field_access(id, f, v, false);
+}
+
+extern "C" hv_return_t _hv_vcpu_set_control_field(hv_vcpu_t id,
+                                                 _hv_control_field_t f,
+                                                 uint64_t v) {
+    return control_field_access(id, f, &v, true);
+}
+
 extern "C" hv_return_t __hv_vcpu_get_ext_reg(hv_vcpu_t id, _hv_ext_reg_t reg, uint64_t *value) {
     VcpuSlot *s = owned_vcpu(id); if (!s || !value) return HV_BAD_ARGUMENT;
     if ((unsigned)reg >= sizeof(ohv_extregs_t) / 8) return HV_BAD_ARGUMENT;

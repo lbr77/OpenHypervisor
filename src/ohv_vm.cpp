@@ -4,7 +4,16 @@
 #include <sys/mman.h>
 #include <errno.h>
 #include "ohv_internal.h"
+#include <cstring>
+#include <cstdlib>
 #include "openhyp/ohv_trap.h"
+
+namespace {
+const unsigned kNestedSpaces = 8;   /* what the framework asks for */
+uint64_t g_nested_asid[kNestedSpaces];
+unsigned g_nested_count;
+}  // namespace
+
 
 using namespace ohv;
 
@@ -125,6 +134,47 @@ extern "C" hv_return_t hv_vm_config_set_ipa_granule(hv_vm_config_t c, hv_ipa_gra
 }
 
 // -------------------------------------------------------------- lifecycle --
+
+/*
+ * The address spaces a guest hypervisor needs before it can exist.
+ *
+ * Guest EL2 is not something the VM-create request carries -- the framework
+ * sends flags = 0 there too.  What it does instead, in Hv::Vm::Vm, is notice
+ * el2_enabled and stand up a GuestHypervisorSpaceManager, which creates eight
+ * nested address spaces through the address-space trap and hands their ASIDs
+ * to a NestedGuestMemoryMap.  Without them the kernel has nothing to run a
+ * guest hypervisor in, and refuses a vCPU entering EL2h as illegal guest
+ * state.
+ *
+ * The request it sends is the constant pair at 0x21b3f4948: min_ipa 0,
+ * ipa_size 0, granule 0x1000, flags 0, with the ASID read back out.
+ */
+uint64_t ohv_nested_asid(unsigned index) {
+    return index < g_nested_count ? g_nested_asid[index] : 0;
+}
+
+static void nested_spaces_create(void) {
+    for (unsigned i = 0; i < kNestedSpaces; i++) {
+        ohv_vm_addrspace_create_t a{};
+
+        a.granule = 0x1000;
+        hv_return_t r = ohv_raw_trap(OHV_TRAP_VM_ADDRESS_SPACE_CREATE, &a);
+
+        if (r != HV_SUCCESS) {
+            /*
+             * Say so.  A guest hypervisor with no address spaces is refused
+             * later, at the first run, as illegal guest state -- which says
+             * nothing about the space that could not be made here.
+             */
+            fprintf(stderr, "[ohv] nested address space %u refused (%#x)\n", i, r);
+            break;
+        }
+        if (g_nested_count < kNestedSpaces) {
+            g_nested_asid[g_nested_count++] = a.out_asid;
+        }
+    }
+}
+
 extern "C" hv_return_t hv_vm_create(hv_vm_config_t config) {
     pthread_mutex_lock(&g_vm_mutex);
     hv_return_t r = HV_SUCCESS;
@@ -135,6 +185,13 @@ extern "C" hv_return_t hv_vm_create(hv_vm_config_t config) {
         args.min_ipa = 0;
         args.ipa_size = bits ? (1ull << bits) : 0;
         args.granule = config ? config->granule : 0;
+        /*
+         * Flags are zero, which is what the framework sends too: Hv::Vm::create
+         * builds {min_ipa, ipa_size, granule@16, flags@20 = 0, isa@24} and
+         * leaves it at that.  Guest EL2 and VHE are not part of this request --
+         * it keeps them in its own Vm object and carries them further down --
+         * so there is nothing to look for here.
+         */
         args.flags = 0;
         args.isa = config ? config->isa : OHV_VM_ISA_APPLE;
         const char *dbg = getenv("OHV_DEBUG");
@@ -150,6 +207,9 @@ extern "C" hv_return_t hv_vm_create(hv_vm_config_t config) {
             g_vm_isa = args.isa;
             g_vm_el2 = config && config->el2_enabled;
             g_vm_vhe = config && config->vhe_enabled;
+            if (g_vm_el2) {
+                nested_spaces_create();
+            }
         }
     } while (0);
     pthread_mutex_unlock(&g_vm_mutex);
@@ -180,6 +240,7 @@ extern "C" hv_return_t hv_vm_get_max_vcpu_count(uint32_t *max) {
 }
 
 // ---------------------------------------------------------------- memory --
+
 static hv_return_t map_op(int trap, void *uva, hv_ipa_t ipa, size_t size, hv_memory_flags_t flags) {
     pthread_mutex_lock(&g_vm_mutex);
     hv_return_t r = require_vm();
@@ -194,17 +255,77 @@ static hv_return_t map_op(int trap, void *uva, hv_ipa_t ipa, size_t size, hv_mem
             ohv_vm_map_item_t item{ (uint64_t)(uintptr_t)uva, ipa, size, flags, 0 };
             r = ohv_raw_trap((unsigned)trap, &item);
             if (mdbg && *mdbg) fprintf(stderr, "[ohv]   -> %d\n", r);
+            /*
+             * A guest hypervisor runs in one of the nested address spaces, and
+             * a space with nothing in it cannot fetch an instruction.  Put the
+             * same memory in each of them, so a vCPU is not left choosing
+             * between an address space that describes its guest and one the
+             * kernel will accept.
+             */
+            if (r == HV_SUCCESS && g_vm_el2) {
+                for (unsigned i = 0; i < g_nested_count; i++) {
+                    ohv_vm_map_item_t in_space{ (uint64_t)(uintptr_t)uva, ipa,
+                                                size, flags, g_nested_asid[i] };
+                    hv_return_t sr = ohv_raw_trap((unsigned)trap, &in_space);
+
+                    if (sr != HV_SUCCESS && mdbg && *mdbg) {
+                        fprintf(stderr, "[ohv]   space %llx -> %d\n",
+                                (unsigned long long)g_nested_asid[i], sr);
+                    }
+                }
+            }
         }
     }
     pthread_mutex_unlock(&g_vm_mutex);
     return r;
 }
 
+/*
+ * What is mapped where, which the kernel does not keep on our behalf.
+ *
+ * A trapped system register access arrives as a reason and nothing else: no
+ * syndrome, no opcode.  Answering it means reading the instruction, and the
+ * instruction is in guest memory, so the guest physical address has to be
+ * turned back into something this process can read.  That needs a record of
+ * the mappings, kept here as they are made.
+ */
+namespace {
+struct MapRecord { uint64_t uva; uint64_t ipa; uint64_t size; };
+MapRecord g_maps[64];
+unsigned g_map_count;
+
+void map_remember(void *uva, uint64_t ipa, uint64_t size) {
+    for (unsigned i = 0; i < g_map_count; i++) {
+        if (g_maps[i].ipa == ipa) { g_maps[i] = { (uint64_t)(uintptr_t)uva, ipa, size }; return; }
+    }
+    if (g_map_count < 64) g_maps[g_map_count++] = { (uint64_t)(uintptr_t)uva, ipa, size };
+}
+
+void map_forget(uint64_t ipa) {
+    for (unsigned i = 0; i < g_map_count; i++) {
+        if (g_maps[i].ipa == ipa) { g_maps[i] = g_maps[--g_map_count]; return; }
+    }
+}
+}  // namespace
+
+void *ohv_guest_ptr(uint64_t ipa, uint64_t len) {
+    for (unsigned i = 0; i < g_map_count; i++) {
+        const MapRecord &m = g_maps[i];
+        if (ipa >= m.ipa && ipa + len <= m.ipa + m.size) {
+            return (void *)(uintptr_t)(m.uva + (ipa - m.ipa));
+        }
+    }
+    return nullptr;
+}
+
 extern "C" hv_return_t hv_vm_map(void *addr, hv_ipa_t ipa, size_t size, hv_memory_flags_t flags) {
     if (!addr) return HV_BAD_ARGUMENT;
-    return map_op(OHV_TRAP_VM_MAP, addr, ipa, size, flags);
+    hv_return_t r = map_op(OHV_TRAP_VM_MAP, addr, ipa, size, flags);
+    if (r == HV_SUCCESS) map_remember(addr, ipa, size);
+    return r;
 }
 extern "C" hv_return_t hv_vm_unmap(hv_ipa_t ipa, size_t size) {
+    map_forget(ipa);
     return map_op(OHV_TRAP_VM_UNMAP, nullptr, ipa, size, 0);
 }
 extern "C" hv_return_t hv_vm_protect(hv_ipa_t ipa, size_t size, hv_memory_flags_t flags) {
