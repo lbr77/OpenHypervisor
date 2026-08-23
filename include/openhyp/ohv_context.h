@@ -233,9 +233,19 @@ typedef struct {
 #define OHV_RW_BANKED_SYSREGS   0x3b8
 #define OHV_RW_DBGREGS          0x478
 #define OHV_RW_VGIC_SYSREGS     0x698
-#define OHV_RW_CONTROLS         0x8e8
-#define OHV_RW_TIMER            0x950
-#define OHV_RW_FROZEN           0x9c0
+/*
+ * The control block sits at 0x920, not 0x8e8 -- seven slots later.  Anchored
+ * twice: VPIDR_EL2 carries MIDR, which the kernel fills identically for every
+ * VM and which lands at the same address either way; and dumping the page
+ * after creating a vCPU shows the kernel's own HCR_EL2 sitting there.
+ *
+ * With the old base every control field written through
+ * _hv_vcpu_set_control_field landed where nothing reads it -- including
+ * TIDCP, which is what delivers the private register traps at all.
+ */
+#define OHV_RW_CONTROLS         0x920
+#define OHV_RW_TIMER            0x988
+#define OHV_RW_FROZEN           0x9f8
 #define OHV_RW_STATE_DIRTY      0xa00
 #define OHV_RW_GUEST_TICKS      0xa08
 #define OHV_RW_EXTREGS          0xa10

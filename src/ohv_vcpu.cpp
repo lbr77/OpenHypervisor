@@ -95,6 +95,28 @@ static void exit_from_ro(VcpuSlot *s) {
             break;
         }
         case OHV_VMEXIT_SYNC:
+            /*
+             * A guarded exit arrives as a plain synchronous exit with no
+             * syndrome: the kernel does not perform GEXIT for a guest at EL2
+             * and does not describe it either.  The framework answers its
+             * caller with EC 0x3f, and a VMM that has to complete the guarded
+             * return needs to be told which exit this is -- so read the
+             * instruction the guest stopped on and say so.
+             *
+             * Only a guest actually in guarded state can execute it; outside
+             * guarded state the same encoding is undefined, which is how the
+             * exception class earns its meaning.
+             */
+            if (e->vmexit_esr == 0) {
+                uint64_t pc = ohv_rw(s->ctx)->regs.pc;
+                const uint32_t *insn = (const uint32_t *)ohv_guest_ptr(pc, 4);
+
+                if (insn && *insn == 0x00201400u) {   /* GEXIT */
+                    out->exception.syndrome =
+                        (0x3full << 26) | (1ull << 25) | 0x22;
+                }
+            }
+            /* fall through */
         case OHV_VMEXIT_SERROR:
         case OHV_VMEXIT_IRQ:
         case OHV_VMEXIT_FIQ:
