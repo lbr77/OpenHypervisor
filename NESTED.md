@@ -133,3 +133,24 @@ traps f788w f7c1w f7c2w f7d2w f78aw f7c0r! f7d6r f7c0r! f7d6w f7d3w f7d4r f7d4w 
 LANDED  elr_gl1 read back 0x40001800  pc 0x40001808  (14 serviced)
 guarded handler entry ELR_GL1 = GENTER+4
 ```
+
+## 结论（2026-08-23 确认）
+
+Hypervisor.framework 在这个 build 上运行的是 **NVHE 模式**：所有 guest 一律跑在
+EL1，不真正进入硬件 EL2。guest 的"EL2"是通过以下机制实现的：
+
+1. 内核为每个 VM/vCPU 配置 HCR_EL2，按 ISA 等级开启特定的 trap 位
+   （包括 TIDCP 使 impdef 寄存器访问产生 trap）
+2. 被trap 的 EL2 寄存器访问以 `ARM_VMEXIT_REASON_MSR_TRAP` 或
+   `ILLEGAL_ERET` 退出到 VMM
+3. 框架的 `handle_get/set_vhe_el2_system_register` 和
+   `handle_get/set_nested_el1_system_register` 应答这些访问，
+   或者通过 hook（`hvf-el2-sysreg-exits.c`）转发给 VMM
+4. guest 软件看到的是一致的 EL2 环境——但硬件 PSTATE 始终是 EL1
+
+因此：
+- 入口 CPSR 必须设为 **EL1h**（`0x3c5`），不能是 EL2h（会被降级或拒绝）
+- 控制字段 idx0（HCR_EL2）的 NV/NV1/NV2 位不影响入口合法性——它们只控制
+  特定 trap 行为，不是"让 guest 进 EL2"的开关
+- 我们库的 sysreg 分派表 + Apple 私有寄存器表已经能正确应答这些 trap，
+  不需要框架的 hook
