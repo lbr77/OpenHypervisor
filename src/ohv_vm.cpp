@@ -200,11 +200,52 @@ static hv_return_t map_op(int trap, void *uva, hv_ipa_t ipa, size_t size, hv_mem
     return r;
 }
 
+/*
+ * What is mapped where, which the kernel does not keep on our behalf.
+ *
+ * A trapped system register access arrives as a reason and nothing else: no
+ * syndrome, no opcode.  Answering it means reading the instruction, and the
+ * instruction is in guest memory, so the guest physical address has to be
+ * turned back into something this process can read.  That needs a record of
+ * the mappings, kept here as they are made.
+ */
+namespace {
+struct MapRecord { uint64_t uva; uint64_t ipa; uint64_t size; };
+MapRecord g_maps[64];
+unsigned g_map_count;
+
+void map_remember(void *uva, uint64_t ipa, uint64_t size) {
+    for (unsigned i = 0; i < g_map_count; i++) {
+        if (g_maps[i].ipa == ipa) { g_maps[i] = { (uint64_t)(uintptr_t)uva, ipa, size }; return; }
+    }
+    if (g_map_count < 64) g_maps[g_map_count++] = { (uint64_t)(uintptr_t)uva, ipa, size };
+}
+
+void map_forget(uint64_t ipa) {
+    for (unsigned i = 0; i < g_map_count; i++) {
+        if (g_maps[i].ipa == ipa) { g_maps[i] = g_maps[--g_map_count]; return; }
+    }
+}
+}  // namespace
+
+void *ohv_guest_ptr(uint64_t ipa, uint64_t len) {
+    for (unsigned i = 0; i < g_map_count; i++) {
+        const MapRecord &m = g_maps[i];
+        if (ipa >= m.ipa && ipa + len <= m.ipa + m.size) {
+            return (void *)(uintptr_t)(m.uva + (ipa - m.ipa));
+        }
+    }
+    return nullptr;
+}
+
 extern "C" hv_return_t hv_vm_map(void *addr, hv_ipa_t ipa, size_t size, hv_memory_flags_t flags) {
     if (!addr) return HV_BAD_ARGUMENT;
-    return map_op(OHV_TRAP_VM_MAP, addr, ipa, size, flags);
+    hv_return_t r = map_op(OHV_TRAP_VM_MAP, addr, ipa, size, flags);
+    if (r == HV_SUCCESS) map_remember(addr, ipa, size);
+    return r;
 }
 extern "C" hv_return_t hv_vm_unmap(hv_ipa_t ipa, size_t size) {
+    map_forget(ipa);
     return map_op(OHV_TRAP_VM_UNMAP, nullptr, ipa, size, 0);
 }
 extern "C" hv_return_t hv_vm_protect(hv_ipa_t ipa, size_t size, hv_memory_flags_t flags) {

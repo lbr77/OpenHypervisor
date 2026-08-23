@@ -57,13 +57,47 @@ static void exit_from_ro(VcpuSlot *s) {
                 out->reason = HV_EXIT_REASON_EXCEPTION;
             break;
         }
+        case OHV_VMEXIT_MSR_TRAP: {
+            /*
+             * The kernel says a system register access trapped and stops
+             * there: no syndrome, no opcode, and nothing about it anywhere in
+             * the shared pages.  A VMM cannot answer an access it cannot
+             * name, so read the instruction the guest is sitting on and build
+             * the syndrome the exception class is defined to carry.
+             *
+             * PC is a virtual address in general; this reaches it as a guest
+             * physical one, which is right while the guest MMU is off and is
+             * where a monitor being brought up spends its first instructions.
+             * With translation on there is a stage-1 walk to do first, and
+             * until that exists the syndrome stays zero rather than wrong.
+             */
+            uint64_t pc = ohv_rw(s->ctx)->regs.pc;
+            const uint32_t *insn = (const uint32_t *)ohv_guest_ptr(pc, 4);
+
+            out->reason = HV_EXIT_REASON_EXCEPTION;
+            if (insn && (*insn & 0xffd00000u) == 0xd5100000u) {
+                uint32_t i = *insn;
+                uint32_t read = (i >> 21) & 1;
+                uint32_t op0 = 2 + ((i >> 19) & 1);
+                uint32_t op1 = (i >> 16) & 7;
+                uint32_t crn = (i >> 12) & 0xf;
+                uint32_t crm = (i >> 8) & 0xf;
+                uint32_t op2 = (i >> 5) & 7;
+                uint32_t rt = i & 0x1f;
+
+                out->exception.syndrome =
+                    (0x18ull << 26) | (1ull << 25) |
+                    (op0 << 20) | (op2 << 17) | (op1 << 14) |
+                    (crn << 10) | (rt << 5) | (crm << 1) | read;
+            }
+            break;
+        }
         case OHV_VMEXIT_SYNC:
         case OHV_VMEXIT_SERROR:
         case OHV_VMEXIT_IRQ:
         case OHV_VMEXIT_FIQ:
         case OHV_VMEXIT_UNHANDLED_FAULT:
         case OHV_VMEXIT_UNKNOWN_TRAP:
-        case OHV_VMEXIT_MSR_TRAP:
         case OHV_VMEXIT_ILLEGAL_ERET:
         case OHV_VMEXIT_VGIC:
         case OHV_VMEXIT_SME_TRAP:
@@ -361,6 +395,37 @@ extern "C" hv_return_t __hv_vcpu_get_context(hv_vcpu_t id, void **context) {
     VcpuSlot *s = owned_vcpu(id); if (!s || !context) return HV_BAD_ARGUMENT;
     *context = s->ctx; return HV_SUCCESS;
 }
+/*
+ * The same private surface under the names Apple actually exports.
+ *
+ * Every consumer of this surface reaches it with dlsym("_hv_..."), because
+ * the symbols are not in any SDK header -- QEMU's HVF backend does exactly
+ * that.  Exporting only the two-underscore spelling means those lookups
+ * return null and the caller carries on with the feature quietly disabled:
+ * control fields are never written, so the traps they enable never arrive,
+ * and the context is never read.  Nothing reports an error, which is the
+ * worst shape a missing symbol can take.
+ *
+ * _hv_vcpu_get_context also has a different shape there: it answers with the
+ * pointer rather than writing it through an out-parameter.
+ */
+extern "C" void *_hv_vcpu_get_context(hv_vcpu_t id) {
+    VcpuSlot *s = owned_vcpu(id);
+    return s ? s->ctx : nullptr;
+}
+
+extern "C" hv_return_t _hv_vcpu_get_control_field(hv_vcpu_t id,
+                                                 _hv_control_field_t f,
+                                                 uint64_t *v) {
+    return control_field_access(id, f, v, false);
+}
+
+extern "C" hv_return_t _hv_vcpu_set_control_field(hv_vcpu_t id,
+                                                 _hv_control_field_t f,
+                                                 uint64_t v) {
+    return control_field_access(id, f, &v, true);
+}
+
 extern "C" hv_return_t __hv_vcpu_get_ext_reg(hv_vcpu_t id, _hv_ext_reg_t reg, uint64_t *value) {
     VcpuSlot *s = owned_vcpu(id); if (!s || !value) return HV_BAD_ARGUMENT;
     if ((unsigned)reg >= sizeof(ohv_extregs_t) / 8) return HV_BAD_ARGUMENT;

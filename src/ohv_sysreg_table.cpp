@@ -116,6 +116,10 @@ static const SysRegDesc kTable[] = {
     {0xe208,0,5,0,false},
 };
 const SysRegDesc *sysreg_lookup(uint16_t enc) {
+    /* Ask the hand-kept Apple table first; the generator cannot describe it. */
+    if (const SysRegDesc *apple = sysreg_lookup_apple(enc)) {
+        return apple;
+    }
     switch (enc) {
     case HV_SYS_REG_DBGBVR0_EL1: return &kTable[0];
     case HV_SYS_REG_DBGBCR0_EL1: return &kTable[1];
