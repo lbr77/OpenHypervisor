@@ -1,3 +1,10 @@
 *.o
 *.dylib
-*.dSYM
+*.dSYM*.o
+*.d
+libopenhyp.dylib
+tests/libopenhyp.dylib
+tests/smoke_bin
+tests/smoke_bin.dSYM/
+tests/smoke_static
+tests/smoke_static.dSYM/
