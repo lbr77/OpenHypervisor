@@ -146,6 +146,10 @@ unsigned g_nested_count;
  * The request it sends is the constant pair at 0x21b3f4948: min_ipa 0,
  * ipa_size 0, granule 0x1000, flags 0, with the ASID read back out.
  */
+uint64_t ohv_nested_asid(unsigned index) {
+    return index < g_nested_count ? g_nested_asid[index] : 0;
+}
+
 static void nested_spaces_create(void) {
     for (unsigned i = 0; i < kNestedSpaces; i++) {
         ohv_vm_addrspace_create_t a{};

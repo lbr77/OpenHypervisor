@@ -68,5 +68,7 @@ const SysRegDesc *sysreg_lookup_apple(uint16_t encoding);
 
 } // namespace ohv
 void *ohv_guest_ptr(uint64_t ipa, uint64_t len);
+/* The nested address spaces a guest hypervisor runs in, if any. */
+uint64_t ohv_nested_asid(unsigned index);
 
 #endif

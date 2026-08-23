@@ -1,6 +1,7 @@
 // ohv_vcpu.cpp - vCPU lifecycle, register access, run loop glue.
 #include <mach/mach_time.h>
 #include "ohv_internal.h"
+#include <cstdio>
 #include "openhyp/ohv_trap.h"
 
 using namespace ohv;
@@ -140,6 +141,27 @@ extern "C" hv_return_t hv_vcpu_create(hv_vcpu_t *vcpu_out, hv_vcpu_exit_t **exit
     s.owner = pthread_self();
     s.run_count = 0;
     tl_current_vcpu = &s;
+
+    /*
+     * A vCPU that will run a guest hypervisor has to be in one of the nested
+     * address spaces the VM stood up; the framework assigns one through the
+     * same trap.  Without it the kernel has nowhere to put guest EL2 and
+     * refuses the first run as illegal guest state.
+     */
+    if (ohv::g_vm_el2) {
+        uint64_t asid = ohv_nested_asid(0);
+
+        if (asid) {
+            hv_return_t sr = ohv_raw_trap(OHV_TRAP_VCPU_SET_ADDRESS_SPACE,
+                                          (void *)(uintptr_t)asid);
+
+            if (sr != HV_SUCCESS) {
+                fprintf(stderr, "[ohv] vcpu could not join nested space"
+                                " %#llx (%#x)\n",
+                        (unsigned long long)asid, sr);
+            }
+        }
+    }
     *vcpu_out = id;
     *exit = &s.pub_exit;
     pthread_mutex_unlock(&g_vcpus_mutex);
