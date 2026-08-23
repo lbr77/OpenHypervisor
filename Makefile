@@ -9,6 +9,7 @@ SRCS := src/ohv_trap.cpp src/ohv_state.cpp src/ohv_vm.cpp src/ohv_vcpu.cpp \
         src/ohv_gic.cpp src/ohv_misc.cpp src/ohv_sysreg_apple.cpp src/ohv_sysreg_table.cpp \
         src/ohv_caps_field.cpp src/ohv_extras.cpp
 OBJS := $(SRCS:.cpp=.o)
+DEPS := $(OBJS:.o=.d)
 
 all: libopenhyp.dylib smoke smoke_static
 
@@ -22,8 +23,14 @@ libopenhyp.dylib: $(OBJS)
 %.o: %.cpp
 	$(CC) $(CXXFLAGS) -c $< -o $@
 
--include $(OBJS:.o=.d)
+-include $(DEPS)
 
+
+# Runtime offset matcher: maps the original Hypervisor.framework, walks its
+# __TEXT as raw bytes and re-derives every offset pinned in ohv_context.h /
+# ohv_vm.cpp on the running OS. Exit 1 = drift or missing evidence.
+offset_probe: tools/offset_probe.cpp
+	$(CC) -std=c++17 -O1 -Wall -Wextra -arch $(ARCH) -o tools/offset_probe $<
 # Dylib-linked variant. Loading an ad-hoc dylib requires disabling library
 # validation in the entitlements (tests/hv.ent) plus amfidont (see
 # tools/run-smoke.sh); the static variant (smoke_static) has no such needs.
@@ -35,6 +42,6 @@ smoke: tests/smoke.cpp libopenhyp.dylib
 	codesign --force --sign - --entitlements tests/hv.ent tests/libopenhyp.dylib
 
 clean:
-	rm -f $(OBJS) libopenhyp.dylib tests/smoke_bin
+	rm -f $(OBJS) $(DEPS) libopenhyp.dylib tests/smoke_bin
 
-.PHONY: all clean smoke
+.PHONY: all clean smoke offset_probe

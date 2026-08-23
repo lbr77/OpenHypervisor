@@ -7,4 +7,6 @@ tests/libopenhyp.dylib
 tests/smoke_bin
 tests/smoke_bin.dSYM/
 tests/smoke_static
+tools/offset_probe
 tests/smoke_static.dSYM/
+.DS_Store

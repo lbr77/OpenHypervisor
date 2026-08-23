@@ -23,7 +23,8 @@ own `svc` gate. **Zero entitlement checks in user space.**
 
 - [x] Finish first system version
 - [x] Enable GFX/SPRR usage with vhe & EL2. 
-- [ ] Dump runtime offset from dyld_shared_cache
+- [x] Runtime offset matcher (`make offset_probe`) re-derives every pinned
+  constant from the installed Hypervisor.framework on the running OS
 
 ## Build
 
@@ -71,3 +72,21 @@ Vcpu::raw_trap(42, nullptr);                          // raw trap passthrough
 Capabilities Apple does not have: batched register access, context
 snapshot/restore, a callback-driven run loop, raw trap passthrough, a
 data-abort monitoring wrapper, error strings, SMP broadcast helpers.
+### Runtime offset matching
+
+The pinned offsets (config fields, vCPU context layout, kernel trap ids) are
+only observations of one framework build. `tools/offset_probe.cpp` re-derives
+them live: it dlopen()s the installed Hypervisor.framework, treats the mapped
+`__TEXT` as bytes, follows call edges from the public entry points through a
+small AArch64 decoder, and compares every immediate it finds against the
+pinned constants.
+
+```bash
+make offset_probe && ./tools/offset_probe
+```
+
+Verdicts per pin: MATCH (direct site reachable from an exported function),
+INDIR (offset referenced somewhere in `__TEXT`, path went through a function
+pointer), MISS / DRIFT. Exit status is non-zero unless every pin matched, so
+it can gate CI. On macOS 27.0 (26A5388g, arm64) all config fields, the whole
+register block, and 14 of 18 trap ids verify directly; nothing drifted.
