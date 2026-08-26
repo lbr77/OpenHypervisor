@@ -2026,6 +2026,33 @@ extern "C" hv_return_t hv_vcpu_create(hv_vcpu_t *vcpu_out, hv_vcpu_exit_t **exit
          */
         hcr |= OHV_HCR_AMO | OHV_HCR_IMO | OHV_HCR_FMO;
         /*
+         * Trap WFE, so a parked core is a core this side can hear from.
+         *
+         * The interrupt gates are evaluated at exits.  A WFI exits, but a WFE
+         * without HCR_EL2.TWE does not: the core simply stops inside the
+         * guest and nothing on this side runs again for it.  XNU's idle wait
+         * is a WFE --
+         *
+         *     mrs x13, ISR_EL1 ; cbnz x13, out ; wfe ; cmn x1, #1 ; b.eq loop
+         *
+         * -- and it leaves only when ISR_EL1 goes non-zero, which is to say
+         * only when the level this side is withholding goes up.  Without the
+         * trap that is a closed circle: the level is held because PSTATE has
+         * the mask bit set, and the mask bit can never change because the
+         * core is not running.  Measured at a stall: the panicking core sent
+         * the debugger's cross-call to all five others and only the one whose
+         * FIQ line was still clear answered; the other four had a pending
+         * IPI_SR bit from an earlier one they had never been able to take.
+         *
+         * With the trap, the WFE is the exit, the VMM reports it through
+         * ohv_vcpu_set_parked(), and a parked core is exactly the case the
+         * gate can always say yes to.  OHV_NO_TWE=1 puts the old behaviour
+         * back.
+         */
+        if (!ohv_env("OHV_NO_TWE")) {
+            hcr |= OHV_HCR_TWE;
+        }
+        /*
          * OHV_HCR_TIDCP=0 hands the Apple registers back to the kernel.
          *
          * The kernel's own default for a new vCPU is HCR_TIDCP | HCR_API |

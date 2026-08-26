@@ -189,6 +189,7 @@ enum ohv_vm_isa {
 #define OHV_HCR_NV2               (1ull << 45)
 #define OHV_HCR_E2H               (1ull << 34)
 #define OHV_HCR_TIDCP             (1ull << 20)
+#define OHV_HCR_TWE               (1ull << 14)
 #define OHV_HCR_FMO  (1ull << 3)
 #define OHV_HCR_IMO  (1ull << 4)
 #define OHV_HCR_AMO  (1ull << 5)
