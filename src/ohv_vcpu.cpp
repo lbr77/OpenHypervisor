@@ -1649,7 +1649,15 @@ static ExitAction exit_from_ro(VcpuSlot *s) {
      * through to it.  Only a synchronous exit carries a syndrome worth
      * reading; anything else clears the flag rather than latching a stale one.
      */
-    s->in_wfx = (reason == 1) && (((e->vmexit_esr >> 26) & 0x3f) == 0x1);
+    /*
+     * in_wfx is not derived here any more.  A WFI or WFE never arrived as a
+     * synchronous exit with EC 0x1 on this path -- traced over a whole boot,
+     * 2.29 million withheld levels and the flag was zero in every one of them.
+     * The VMM sees the WFx directly, as EC_WFX_TRAP, and says so through
+     * ohv_vcpu_set_parked().
+     */
+    s->last_reason = reason;
+    s->last_esr = e->vmexit_esr;
 
     switch (reason) {
         case 0:
@@ -2971,6 +2979,25 @@ static void ohv_set_irq_level(VcpuSlot *s) {
                      ohv_irq_takeable(s));
     uint64_t want = want_irq ? (1ull << 7) : 0;
 
+    /*
+     * The one line that says why a level is being withheld.  OHV_TRACE_GATE,
+     * capped, because the question is only ever about the first few.
+     */
+    if (s->vmm_irq && !want_irq && ohv_env("OHV_TRACE_GATE")) {
+        {
+            /*
+             * Every one of them.  A budget hides the edge at the end, which is
+             * the only one a stall is about.
+             */
+            fprintf(stderr, "[ohv] gate vcpu %llu IRQ held: wfx %d mon %d"
+                    " pc %#llx cpsr %#x reason %u esr %#llx\n",
+                    (unsigned long long)s->id, (int)s->in_wfx,
+                    ohv_guest_in_monitor(s) ? 1 : 0,
+                    (unsigned long long)ohv_rw(s->ctx)->regs.pc,
+                    (unsigned)ohv_rw(s->ctx)->regs.cpsr,
+                    s->last_reason, (unsigned long long)s->last_esr);
+        }
+    }
     if ((hcr & (1ull << 7)) == want) {
         return;
     }
@@ -3003,6 +3030,18 @@ static void ohv_set_fiq_level(VcpuSlot *s) {
                 ohv_fiq_takeable(s));
     uint64_t want = (vmm || s->timer_fiq) ? (1ull << 6) : 0;
 
+    if (s->vmm_fiq && !vmm && ohv_env("OHV_TRACE_GATE")) {
+        {
+            fprintf(stderr, "[ohv] gate vcpu %llu FIQ held: wfx %d mon %d"
+                    " pc %#llx cpsr %#x reason %u esr %#llx\n",
+                    (unsigned long long)s->id, (int)s->in_wfx,
+                    ohv_guest_in_monitor(s) ? 1 : 0,
+                    (unsigned long long)ohv_rw(s->ctx)->regs.pc,
+                    (unsigned)ohv_rw(s->ctx)->regs.cpsr,
+                    s->last_reason, (unsigned long long)s->last_esr);
+        }
+    }
+
     if ((hcr & (1ull << 6)) == want) {
         return;
     }
@@ -3030,6 +3069,33 @@ static void ohv_set_fiq_level(VcpuSlot *s) {
     }
     ohv_rw_controls(s->ctx)->hcr_el2 = (hcr & ~(1ull << 6)) | want;
     mark_dirty(s->ctx, OHV_STATE_CONTROLS);
+}
+
+/*
+ * The VMM says the guest has stopped on a WFI or a WFE.
+ *
+ * Which is the one moment an interrupt level can always be handed over: a WFx
+ * is never in the middle of a GENTER, so nothing can carry the level into the
+ * monitor, and waking is the whole reason the level exists.  Without this the
+ * cores that most need it were the ones the gate would not answer -- XNU's
+ * idle wait comes out of WFE only when ISR_EL1 goes non-zero, and a core
+ * parked there with DAIF masked can neither be woken nor answer the
+ * debugger's cross-call.
+ *
+ * Cleared by the VMM on the next exception that is not a WFx.
+ */
+extern "C" void ohv_vcpu_set_parked(hv_vcpu_t id, bool parked) {
+    VcpuSlot *s = owned_vcpu(id);
+
+    if (!s) {
+        return;
+    }
+    if (s->in_wfx == parked) {
+        return;
+    }
+    s->in_wfx = parked;
+    ohv_set_fiq_level(s);
+    ohv_set_irq_level(s);
 }
 
 static void ohv_expire_timers(VcpuSlot *s) {

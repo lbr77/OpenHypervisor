@@ -126,6 +126,9 @@ struct VcpuSlot {
      * gate would not answer, and they are the ones that most need it.
      */
     bool in_wfx = false;
+    /* What the last exit was, so the gate trace can say why in_wfx is not set. */
+    unsigned last_reason = 0;
+    uint64_t last_esr = 0;
     /*
      * The Apple implementation-defined registers the guest touches that
      * nothing else answers.  They always trap -- HACR_EL2's THIDDVF, THIDCPU,
