@@ -1644,6 +1644,13 @@ static ExitAction exit_from_ro(VcpuSlot *s) {
     out->exception.physical_address =
         (hpfar & ~0xfffull) | (e->vmexit_far & 0xfff);
 
+    /*
+     * Note a guest stopped on WFI/WFE, so the interrupt gates can let a level
+     * through to it.  Only a synchronous exit carries a syndrome worth
+     * reading; anything else clears the flag rather than latching a stale one.
+     */
+    s->in_wfx = (reason == 1) && (((e->vmexit_esr >> 26) & 0x3f) == 0x1);
+
     switch (reason) {
         case 0:
             /* The run came back with nothing to report. */
@@ -2822,8 +2829,9 @@ static bool ohv_guest_in_monitor(VcpuSlot *s) {
  * spins forever at link 0xfffffff007060770 with the nesting depth at one.
  */
 static bool ohv_fiq_takeable(VcpuSlot *s) {
-    return !ohv_guest_in_monitor(s) &&
-           (ohv_rw(s->ctx)->regs.cpsr & (1u << 6)) == 0;
+    return s->in_wfx ||
+           (!ohv_guest_in_monitor(s) &&
+            (ohv_rw(s->ctx)->regs.cpsr & (1u << 6)) == 0);
 }
 
 /*
@@ -2841,8 +2849,9 @@ static bool ohv_fiq_takeable(VcpuSlot *s) {
  * is up; withheld, it never wakes at all.
  */
 static bool ohv_irq_takeable(VcpuSlot *s) {
-    return !ohv_guest_in_monitor(s) &&
-           (ohv_rw(s->ctx)->regs.cpsr & (1u << 7)) == 0;
+    return s->in_wfx ||
+           (!ohv_guest_in_monitor(s) &&
+            (ohv_rw(s->ctx)->regs.cpsr & (1u << 7)) == 0);
 }
 
 static bool ohv_timer_fiq_wanted(VcpuSlot *s) {

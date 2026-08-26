@@ -118,6 +118,15 @@ struct VcpuSlot {
     /* The VMM's virtual IRQ, held here so its level can be gated like the FIQ. */
     bool vmm_irq = false;
     /*
+     * The guest stopped on a WFI or a WFE.
+     *
+     * Which is a moment the interrupt gates can always say yes to: a WFx is
+     * never in the middle of a GENTER, and waking is the whole reason the
+     * level exists.  Cores sitting in XNU's idle wait were the last ones the
+     * gate would not answer, and they are the ones that most need it.
+     */
+    bool in_wfx = false;
+    /*
      * The Apple implementation-defined registers the guest touches that
      * nothing else answers.  They always trap -- HACR_EL2's THIDDVF, THIDCPU,
      * THIDLLC, THIDAMX and THIDDPC are in the kernel's fixed set -- and left
