@@ -116,6 +116,16 @@ typedef struct __attribute__((packed)) {
 } ohv_vm_monitor_data_abort_t;
 
 typedef struct __attribute__((packed)) {
+    /*
+     * What trap 0 copies out starts with a header the fields below do not
+     * describe: the first word counts something the kernel version decides,
+     * and the rest reads as zero here.  It was left out when this was first
+     * written, which put every named field 0x40 bytes early -- control_hcr
+     * landed on the header, ctr_el0 on a CCSIDR entry, the ID registers on
+     * each other -- so the one caller that needed control_hcr reached it by
+     * raw offset instead, and everything else quietly read the wrong word.
+     */
+    uint64_t __header[8];
     uint64_t control_hcr;
     uint64_t control_hacr;
     uint64_t control_cptr;
@@ -178,19 +188,42 @@ enum ohv_vm_isa {
 #define OHV_HCR_NV1               (1ull << 43)
 #define OHV_HCR_NV2               (1ull << 45)
 #define OHV_HCR_E2H               (1ull << 34)
+#define OHV_HCR_TIDCP             (1ull << 20)
+#define OHV_HCR_FMO  (1ull << 3)
+#define OHV_HCR_IMO  (1ull << 4)
+#define OHV_HCR_AMO  (1ull << 5)
+#define OHV_HCR_TID3              (1ull << 18)
+#define OHV_HCR_TSC               (1ull << 19)
+/* HACR_EL2 is Apple's, and this is what the framework runs its vCPUs with. */
+#define OHV_HACR_APPLE_DEFAULT    0x0100000000000000ull
 /*
- * NV and NV2, and deliberately not NV1.  All three have to be *settable* for
- * nesting to be available -- that is the capability the framework tests -- but
- * only these two are set to run a guest hypervisor.  NV1 changes what the EL1
- * translation regime means, and with it on the register redirection the guest
- * depends on does not happen: the first access to an EL2 register faults
- * instead of landing in the VNCR page.  Measured against the framework, which
- * runs its guest hypervisor with 0x2400000000000 of these three.
+ * Trap the guarded execution registers.  The kernel's own default has this on
+ * and lists it as overridable, so a VMM that hands it a HACR without the bit
+ * turns the traps off -- which is what leaves SPTM's MSR ELR_GL1 / SPSR_GL1
+ * invisible, and with them invisible the ERET that follows returns to whatever
+ * the guest's EL2 pair happens to hold.
+ */
+#define OHV_HACR_TGXF             (1ull << 13)
+/*
+ * NV and NV2, and deliberately not NV1 -- which is what the framework runs
+ * this machine's guest hypervisor with: its HCR_EL2 reads 0x00202704021c0000,
+ * and bit 43 is clear in it.
+ *
+ * NV1 does change what the guest sees: with it on, the boot ROM's write to
+ * VBAR_EL2 stops arriving as a trapped register access and the core runs on
+ * past the point it otherwise dies at.  That is not evidence for it.  The
+ * guarded-level probe, which is the thing that actually exercises guest EL2,
+ * stops working entirely with NV1 on -- its guest takes an exception straight
+ * after setting its vector base and never reaches GENTER -- and the framework
+ * gets the same redirection without it.  Whatever is missing here is missing
+ * somewhere else.
  */
 #define OHV_HCR_NESTED            (OHV_HCR_NV | OHV_HCR_NV2)
 
 /* The settable-HCR mask inside what trap 0 copies out
- * (Arm::HypervisorCapabilities::get_control_hcr reads it at this offset). */
+ * (Arm::HypervisorCapabilities::get_control_hcr reads it at this offset).
+ * Now that the header is declared this is just where the field is, and the
+ * static assert below is what keeps the two from drifting apart again. */
 #define OHV_CAPS_CONTROL_HCR_OFF  0x40
 
 // ----------------------------------------------------------- vmexit info --

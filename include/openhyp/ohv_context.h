@@ -236,6 +236,40 @@ typedef struct {
 // lands on vpidr at +0x28 (NESTED.md's field-5 MIDR anchor) and entry 17 on
 // hcrx at +0xd0 -- both match the kernel's sequential controls order from
 // this base.  The vtimer words sit inside it at their kernel slots.
+/*
+ * The guest hypervisor's own EL2 registers, which are separate from the run
+ * controls above: those are what this library programs to run the guest, and
+ * these are what the guest believes it has.  Measured by writing each through
+ * the framework and finding where it landed.
+ */
+/*
+ * The guest hypervisor's own EL2 registers live in a VNCR page at 0x1000, at
+ * the offsets the architecture defines for one.  Five of them were measured
+ * -- VTTBR_EL2, VTCR_EL2, CNTVOFF_EL2, HCR_EL2 and TPIDR_EL2 -- and each
+ * landed exactly where the table below says, which is what identifies the
+ * page as such.
+ */
+/*
+ * SPSR_GL1, inside the extended registers.  A guarded return has somewhere to
+ * return to and this describes it; outside guarded state nothing has written
+ * it and it reads zero, which is what separates a guarded ERET from an
+ * ordinary one.
+ *
+ * The word at 0x390 goes to one across a GENTER and looked like the guarded
+ * level itself, and it is what the probe and the VMM both read.  On this
+ * machine's firmware it holds 2 before GXF has been touched at all -- it is
+ * also a shared system register slot -- so it says nothing here.
+ */
+#define OHV_EXT_SPSR_GL1        0xbb0
+
+#define OHV_VNCR_BASE           0x1000
+
+#define OHV_NESTED_VTTBR_EL2    0x1020
+#define OHV_NESTED_VTCR_EL2     0x1040
+#define OHV_NESTED_CNTVOFF_EL2  0x1060
+#define OHV_NESTED_HCR_EL2      0x1078
+#define OHV_NESTED_TPIDR_EL2    0x1090
+
 #define OHV_RW_CONTROLS         0x920
 #define OHV_RW_VTIMER_OFFSET    0x950   /* controls + 0x30 */
 #define OHV_RW_TIMER            0x988   /* controls + 0x68 */
@@ -247,14 +281,35 @@ typedef struct {
 #define OHV_RW_AVNCR            0x2000
 
 #define OHV_RO_VER              0x4000
+/*
+ * Where the kernel describes the exit it just took.  These are the offsets
+ * the framework's own exception handler reads: the reason as a word at
+ * 0x4008, then the syndrome as a full 64 bits at 0x4010, the faulting address
+ * at 0x4020 and the intermediate physical one at 0x4028.
+ *
+ * They were four bytes and then eight bytes out here, which put the syndrome
+ * on the tail of the reason and the addresses on each other.  Everything read
+ * as zero, and a library that cannot see a syndrome has to invent one: that
+ * is where the guesswork over trapped register accesses came from, and it was
+ * guessing about a value the kernel had already written down.
+ */
 #define OHV_RO_EXIT             0x4008
 #define OHV_RO_EXIT_REASON      0x4008
-#define OHV_RO_EXIT_ESR         0x400c
-#define OHV_RO_EXIT_INSTR       0x4010
-#define OHV_RO_EXIT_FAR         0x4018
-#define OHV_RO_EXIT_HPFAR       0x4020
+#define OHV_RO_EXIT_ESR         0x4010
+#define OHV_RO_EXIT_FAR         0x4020
+#define OHV_RO_EXIT_HPFAR       0x4028
 #define OHV_RO_CONTROLS         0x4028  /* framework mirrors controls here too */
 #define OHV_RO_STATE_VALID      0x4100
+/*
+ * What of the shared copy the kernel says is currently good.  The framework
+ * tests a bit of this word before every system register it touches and syncs
+ * first when the bit is clear -- bit 0 for the banked registers, bit 61 for
+ * the extended ones -- which is what keeps a read off a mirror the guest has
+ * since moved past.  It is a validity mask, not a dirty one; reading a stale
+ * VBAR_EL1 out of it is how a VMM ends up with a value the architecture
+ * cannot hold.
+ */
+#define OHV_RO_STATE_VALID      0x4108
 #define OHV_RO_STATE_DIRTY      0x4108
 #define OHV_RO_STATE_USED       0x4110
 #define OHV_RO_ICH_VTR          0x4118
@@ -319,12 +374,12 @@ typedef struct {
 } ohv_rw_page_head_t; // RW page head; vncr/avncr accessed by raw offset
 
 typedef struct {
-    uint32_t vmexit_reason;
-    uint32_t vmexit_esr;
-    uint32_t vmexit_instr;
+    uint32_t vmexit_reason;   /* +0x4008 */
     uint32_t __pad;
-    uint64_t vmexit_far;
-    uint64_t vmexit_hpfar;
+    uint64_t vmexit_esr;      /* +0x4010 */
+    uint64_t __unread;        /* +0x4018, whatever it is */
+    uint64_t vmexit_far;      /* +0x4020 */
+    uint64_t vmexit_hpfar;    /* +0x4028 */
 } ohv_vmexit_info_t;
 
 typedef struct {

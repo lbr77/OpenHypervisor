@@ -3,9 +3,9 @@ CC      := clang++
 ARCH    := arm64
 CXXFLAGS := -std=c++17 -O0 -g -Wall -Wextra -arch $(ARCH) -fno-omit-frame-pointer \
             -Iinclude -Isrc -D_GNU_SOURCE -MMD -MP
-LDFLAGS := -arch $(ARCH) -dynamiclib -install_name @rpath/libopenhyp.dylib
+LDFLAGS := -arch $(ARCH) -lobjc -dynamiclib -install_name @rpath/libopenhyp.dylib
 
-SRCS := src/ohv_trap.cpp src/ohv_state.cpp src/ohv_vm.cpp src/ohv_vcpu.cpp \
+SRCS := src/ohv_object.cpp src/ohv_alias.cpp src/ohv_trap.cpp src/ohv_state.cpp src/ohv_vm.cpp src/ohv_vcpu.cpp \
         src/ohv_gic.cpp src/ohv_misc.cpp src/ohv_sysreg_apple.cpp src/ohv_sysreg_table.cpp \
         src/ohv_caps_field.cpp src/ohv_extras.cpp
 OBJS := $(SRCS:.cpp=.o)

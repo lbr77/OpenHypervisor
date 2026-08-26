@@ -1,5 +1,7 @@
 // ohv_vm.cpp - VM lifecycle, guest memory, config objects.
+#include <new>
 #include <stdio.h>
+#include "openhyp/ohv_object.h"
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <errno.h>
@@ -22,22 +24,29 @@ using namespace ohv;
 // ohv_vm_create_t we build from it. Framework-observed offsets are pinned:
 // granule@0x14, el2@24, vhe@25, isa@28 (PROTOCOL.md section 3).
 struct hv_vm_config_s {
+    Class __isa;            /* os_release() reads this; see ohv_object.h */
     uint32_t refcnt;
     uint32_t ipa_bits;
     uint8_t __pad_to_granule[0x14 - 8];
-    uint32_t granule;       // +0x14
+    uint32_t granule;       // +0x14 behind the isa
     uint8_t el2_enabled;    // +24
     uint8_t vhe_enabled;    // +25
     uint8_t pad[2];
     uint32_t isa;           // +28
 };
-static_assert(offsetof(hv_vm_config_s, granule) == 0x14, "granule@0x14");
-static_assert(offsetof(hv_vm_config_s, el2_enabled) == 24, "el2@24");
-static_assert(offsetof(hv_vm_config_s, vhe_enabled) == 25, "vhe@25");
-static_assert(offsetof(hv_vm_config_s, isa) == 28, "isa@28");
+/*
+ * The offsets are the ones the framework's own accessors use, measured from
+ * behind the object header rather than from the start of the allocation.
+ */
+#define OHV_VM_CONFIG_AT(f) (offsetof(hv_vm_config_s, f) - sizeof(Class))
+static_assert(OHV_VM_CONFIG_AT(granule) == 0x14, "granule@0x14");
+static_assert(OHV_VM_CONFIG_AT(el2_enabled) == 24, "el2@24");
+static_assert(OHV_VM_CONFIG_AT(vhe_enabled) == 25, "vhe@25");
+static_assert(OHV_VM_CONFIG_AT(isa) == 28, "isa@28");
 
 extern "C" hv_vm_config_t hv_vm_config_create(void) {
-    hv_vm_config_s *c = new hv_vm_config_s{};
+    hv_vm_config_s *c = (hv_vm_config_s *)ohv_object_alloc(sizeof(*c));
+    if (!c) return nullptr;
     c->refcnt = 1;
     c->ipa_bits = 0; // 0 = machine default
     c->granule = 0;  // 0 = default granule
@@ -46,6 +55,20 @@ extern "C" hv_vm_config_t hv_vm_config_create(void) {
 }
 
 extern "C" uint32_t hv_vm_get_isa(void) { return g_vm_alive ? g_vm_isa : OHV_VM_ISA_NONE; }
+
+/*
+ * The framework spells this one with the underscore in the C name, and hands
+ * the level back through the argument rather than the return value.  A caller
+ * that reads the granted level back after hv_vm_create -- qemu does, and
+ * refuses to run when it cannot -- looks it up by that name through dlsym, so
+ * the name and the shape both have to match to be a drop-in.
+ */
+extern "C" hv_return_t _hv_vm_get_isa(uint32_t *isa) {
+    if (!isa) return HV_BAD_ARGUMENT;
+    if (!g_vm_alive) return HV_BAD_ARGUMENT;
+    *isa = g_vm_isa;
+    return HV_SUCCESS;
+}
 
 static uint32_t machine_ipa_bits() {
     static uint32_t cached = 0;
@@ -150,6 +173,10 @@ extern "C" hv_return_t hv_vm_config_set_ipa_granule(hv_vm_config_t c, hv_ipa_gra
  * ipa_size 0, granule 0x1000, flags 0, with the ASID read back out.
  */
 uint64_t ohv_nested_asid(unsigned index) {
+    if (getenv("OHV_TRACE_NESTED")) {
+        fprintf(stderr, "[ohv] nested spaces available: %u (asking for %u)\n",
+                g_nested_count, index);
+    }
     return index < g_nested_count ? g_nested_asid[index] : 0;
 }
 
@@ -227,7 +254,14 @@ extern "C" hv_return_t hv_vm_destroy(void) {
     if (r == HV_SUCCESS) {
         g_vm_alive = false;
         g_gic = nullptr;
-        for (auto &s : g_vcpus) s = VcpuSlot{};
+        /*
+         * Rebuilt in place rather than copy-assigned: a slot now holds an
+         * atomic, and those cannot be assigned.
+         */
+        for (auto &s : g_vcpus) {
+            s.~VcpuSlot();
+            new (&s) VcpuSlot();
+        }
     }
     pthread_mutex_unlock(&g_vm_mutex);
     return r;

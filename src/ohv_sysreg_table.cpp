@@ -114,6 +114,16 @@ static const SysRegDesc kTable[] = {
     {0xdf19,1,18,OHV_STATE_SYSREGS,true},
     {0xdf1a,1,9,OHV_STATE_SYSREGS,true},
     {0xe208,0,5,0,false},
+    /*
+     * The physical timer pair.  Hypervisor.framework names only the virtual
+     * one, so a VMM that has to wake a halted guest at the moment its
+     * physical timer comes due has nothing to ask for -- and this guest arms
+     * CNTP, not CNTV.  Indices 19 and 10 are the banked slots the kernel
+     * loads the hardware timer from, and the compare value in them is in the
+     * host's counter, so a VMM can compare it against its own clock.
+     */
+    {0xdf11,7,30,0,false},                  /* CNTP_CTL_EL0, shadowed */
+    {0xdf12,1,10,OHV_STATE_SYSREGS,true},   /* CNTP_CVAL_EL0 */
 };
 const SysRegDesc *sysreg_lookup(uint16_t enc) {
     /* Ask the hand-kept Apple table first; the generator cannot describe it. */
@@ -233,6 +243,8 @@ const SysRegDesc *sysreg_lookup(uint16_t enc) {
     case HV_SYS_REG_CNTV_CTL_EL0: return &kTable[109];
     case HV_SYS_REG_CNTV_CVAL_EL0: return &kTable[110];
     case HV_SYS_REG_SP_EL1: return &kTable[111];
+    case 0xdf11: return &kTable[112];   /* CNTP_CTL_EL0  */
+    case 0xdf12: return &kTable[113];   /* CNTP_CVAL_EL0 */
     default: return nullptr;
     }
 }

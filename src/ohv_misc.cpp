@@ -1,29 +1,140 @@
 // ohv_misc.cpp - SME/AMX, spaces, capabilities, private vcpu-config surface.
 #include <sys/mman.h>
+#include "openhyp/ohv_object.h"
 #include "ohv_internal.h"
 #include "openhyp/ohv_trap.h"
 
 using namespace ohv;
 
 // ------------------------------------------------------------------ caps --
-struct CapsEntry { uint16_t enc; size_t off; };
-static const CapsEntry kCapsMap[] = {
-#define CAP_OFF(fld) offsetof(ohv_capabilities_t, fld)
-    {HV_SYS_REG_ID_AA64DFR0_EL1, CAP_OFF(id_aa64dfr0_el1)},
-    {HV_SYS_REG_ID_AA64DFR1_EL1, CAP_OFF(id_aa64dfr1_el1)},
-    {HV_SYS_REG_ID_AA64ISAR0_EL1, CAP_OFF(id_aa64isar0_el1)},
-    {HV_SYS_REG_ID_AA64ISAR1_EL1, CAP_OFF(id_aa64isar1_el1)},
-    {HV_SYS_REG_ID_AA64MMFR0_EL1, CAP_OFF(id_aa64mmfr0_el1)},
-    {HV_SYS_REG_ID_AA64MMFR1_EL1, CAP_OFF(id_aa64mmfr1_el1)},
-    {HV_SYS_REG_ID_AA64MMFR2_EL1, CAP_OFF(id_aa64mmfr2_el1)},
-    {HV_SYS_REG_ID_AA64PFR0_EL1, CAP_OFF(id_aa64pfr0_el1)},
-    {HV_SYS_REG_ID_AA64PFR1_EL1, CAP_OFF(id_aa64pfr1_el1)},
-#undef CAP_OFF
+struct CapsEntry {
+    uint16_t enc;
+    uint8_t which;   /* the hv_feature_reg_t index for this register */
 };
+/* Encoding -> the index hv_feature_reg_t names the same register by. */
+static const CapsEntry kCapsMap[] = {
+    {HV_SYS_REG_ID_AA64DFR0_EL1,  0},
+    {HV_SYS_REG_ID_AA64DFR1_EL1,  1},
+    {HV_SYS_REG_ID_AA64ISAR0_EL1, 2},
+    {HV_SYS_REG_ID_AA64ISAR1_EL1, 3},
+    {HV_SYS_REG_ID_AA64MMFR0_EL1, 4},
+    {HV_SYS_REG_ID_AA64MMFR1_EL1, 5},
+    {HV_SYS_REG_ID_AA64MMFR2_EL1, 6},
+    {HV_SYS_REG_ID_AA64PFR0_EL1,  7},
+    {HV_SYS_REG_ID_AA64PFR1_EL1,  8},
+    {0xd801,                      9},   /* CTR_EL0,   s3_3_c0_c0_1 */
+    {0xc801,                     10},   /* CLIDR_EL1, s3_1_c0_c0_1 */
+    {0xd807,                     11},   /* DCZID_EL0, s3_3_c0_c0_7 */
+};
+/*
+ * The kernel hands out the host's ID registers exactly as the silicon has
+ * them.  What a guest is allowed to see is narrower, and the framework
+ * narrows it before anyone reads one: whole fields are cleared, a couple are
+ * pinned to a value, and the physical address range is replaced by whatever
+ * the machine's IPA size rounds down to.
+ *
+ * Handing over the raw ones instead is not a harmless difference.  A VMM
+ * builds its CPU model out of these and then checks the model against itself:
+ * qemu writes each value into its register file and reads it back, and
+ * asserts when the two disagree.  Raw ID_AA64DFR0_EL1 says PMUVer 0xf, which
+ * its model will not hold, and the machine stops before the first
+ * instruction with an assertion about migration code.
+ *
+ * The masks below are the framework's own, read out of it, and each one is
+ * checked against what the framework answers on this machine.
+ */
+static uint64_t parange_field(void) {
+    uint32_t bits = 0;
+
+    if (hv_vm_config_get_max_ipa_size(&bits) != HV_SUCCESS) {
+        return 0;
+    }
+    /* PARange, rounded down to a value the field can name. */
+    if (bits >= 52) return 6;
+    if (bits >= 48) return 5;
+    if (bits >= 44) return 4;
+    if (bits >= 42) return 3;
+    if (bits >= 40) return 2;
+    if (bits >= 36) return 1;
+    return 0;
+}
+
+/*
+ * The two ways in narrow ID_AA64ISAR1_EL1 by different amounts, and the
+ * framework does the same: a caller reading the register off a vcpu config
+ * keeps bits [55:52], a guest reading the register itself does not.  Nothing
+ * else differs between the paths.
+ */
+extern "C" uint64_t ohv_id_reg_for(const ohv_capabilities_t *c, unsigned which,
+                                   bool for_config) {
+    if (which == 3) {
+        return c->id_aa64isar1_el1 &
+               (for_config ? 0x00F0FFFFFFFFFFFFull : 0x0000FFFFFFFFFFFFull);
+    }
+    switch (which) {
+        case 0:  return (c->id_aa64dfr0_el1 & 0xF0F0F000ull) | 6;
+        case 1:  return 0;                                   /* DFR1  */
+        case 2:  return c->id_aa64isar0_el1 & 0xFFFFFFFFF0FFFFF0ull;
+        case 4:  return (c->id_aa64mmfr0_el1 & 0x0000F000FFF000F0ull) |
+                        parange_field();
+        case 5:  return c->id_aa64mmfr1_el1 & 0x0000F000FFFFF0F0ull;
+        case 6:  return c->id_aa64mmfr2_el1 & 0xF0FF00FF0F0FF0FFull;
+        case 7:  return c->id_aa64pfr0_el1 & 0xFF0F0000F0FF00FFull;
+        case 8:  return c->id_aa64pfr1_el1 & 0x0000000F0F00000Full;
+        case 9:  return c->ctr_el0;
+        case 10: return c->clidr_el1;
+        case 11: return c->dczid_el0;
+        case 12: {                                           /* SMFR0 */
+            uint64_t raw = c->id_aa64smfr0_el1;
+
+            if ((raw & 0x0F00000000000000ull) > 0x0200000000000000ull) {
+                return (raw & 0x90F1FFFF70000000ull) | 0x0200000000000000ull;
+            }
+            return raw & 0x9FF1FFFF70000000ull;
+        }
+        case 13: {                                           /* ZFR0 */
+            uint64_t raw = c->id_aa64zfr0_el1;
+
+            if ((raw & 0xFull) <= 2) {
+                return raw & 0x0FF0FF0F0FFF00FFull;
+            }
+            return (raw & 0x0FF0FF0F0FFF00F0ull) | 2;
+        }
+        /* ISAR2, PFR2, MMFR3 and MMFR4: the capabilities carry no field. */
+        case 14: case 15: case 16: case 17: return 0;
+        default: return 0;
+    }
+}
+
+/*
+ * MIDR and MPIDR are not in hv_feature_reg_t and get slots past its last
+ * index; everything else keeps the index it is named by there, so the two
+ * stay in step.
+ */
+#define OHV_ID_SLOT_MIDR  18
+#define OHV_ID_SLOT_MPIDR 19
+
+extern "C" int ohv_id_slot(uint16_t enc) {
+    if (enc == HV_SYS_REG_MIDR_EL1) return OHV_ID_SLOT_MIDR;
+    if (enc == HV_SYS_REG_MPIDR_EL1) return OHV_ID_SLOT_MPIDR;
+    for (auto &e : kCapsMap) {
+        if (e.enc == enc) return e.which;
+    }
+    return -1;
+}
+
 extern "C" uint64_t ohv_caps_field(const ohv_capabilities_t *c, uint16_t enc) {
-    // Serve read-only id registers from the kernel capabilities snapshot.
-    for (auto &e : kCapsMap)
-        if (e.enc == enc) return *(const uint64_t *)((const uint8_t *)c + e.off);
+    /*
+     * MIDR is not in the capabilities at all.  Apple does not vary it across
+     * a part, and the framework answers the same constant every caller
+     * already hardcodes.
+     */
+    if (enc == HV_SYS_REG_MIDR_EL1) {
+        return 0x610f0000ull;
+    }
+    for (auto &e : kCapsMap) {
+        if (e.enc == enc) return ohv_id_reg_for(c, e.which, false);
+    }
     return 0;
 }
 #if 0
@@ -44,25 +155,48 @@ extern "C" uint64_t ohv_caps_field(const ohv_capabilities_t *c, uint16_t enc) {
 }
 #endif
 
+extern const ohv_capabilities_t *ohv_caps_cached();
+
 // ------------------------------------------------------------- vcpu config --
 struct hv_vcpu_config_s {
+    Class __isa;                   /* os_release() reads this */
     uint64_t feature_overrides[2]; // +16/+24 in framework layout
     uint16_t misc;                 // +32
     bool fgt_enabled;
     bool tlbi_workaround;
     uint64_t vmkey;
 };
-extern "C" hv_vcpu_config_t hv_vcpu_config_create(void) { return new hv_vcpu_config_s{}; }
+extern "C" hv_vcpu_config_t hv_vcpu_config_create(void) {
+    return (hv_vcpu_config_t)ohv_object_alloc(sizeof(hv_vcpu_config_s));
+}
 extern "C" hv_return_t __hv_vcpu_config_get_vmkey(hv_vcpu_config_t c, uint64_t *k) { if (!c || !k) return HV_BAD_ARGUMENT; *k = c->vmkey; return HV_SUCCESS; }
 extern "C" hv_return_t __hv_vcpu_config_set_vmkey(hv_vcpu_config_t c, uint64_t k) { if (!c) return HV_BAD_ARGUMENT; c->vmkey = k; return HV_SUCCESS; }
 extern "C" hv_return_t __hv_vcpu_config_get_fgt_enabled(hv_vcpu_config_t c, bool *v) { if (!c || !v) return HV_BAD_ARGUMENT; *v = c->fgt_enabled; return HV_SUCCESS; }
 extern "C" hv_return_t __hv_vcpu_config_set_fgt_enabled(hv_vcpu_config_t c, bool v) { if (!c) return HV_BAD_ARGUMENT; c->fgt_enabled = v; return HV_SUCCESS; }
 extern "C" hv_return_t __hv_vcpu_config_get_tlbi_workaround_enabled(hv_vcpu_config_t c, bool *v) { if (!c || !v) return HV_BAD_ARGUMENT; *v = c->tlbi_workaround; return HV_SUCCESS; }
 extern "C" hv_return_t __hv_vcpu_config_set_tlbi_workaround_enabled(hv_vcpu_config_t c, bool v) { if (!c) return HV_BAD_ARGUMENT; c->tlbi_workaround = v; return HV_SUCCESS; }
+/*
+ * The feature registers a caller reads off a vcpu config are the host's, and
+ * the kernel hands the whole set out in the capabilities: the ID block runs
+ * from +0x148 in exactly the order hv_feature_reg_t names them, with CTR_EL0,
+ * DCZID_EL0 and CLIDR_EL1 sitting earlier.  Answering them matters more than
+ * it looks -- qemu builds its entire host CPU model out of this call, and
+ * refuses to start when any of them fails, which is how it ends up reporting
+ * a missing cntfrq property instead of a missing register.
+ *
+ * These are the raw values.  The framework masks a few fields before handing
+ * them over -- it clears ID_AA64PFR0_EL1.EL2, among others, because its
+ * guests are not told they can have EL2 -- and that is exactly the answer
+ * this library should not be copying: the guest here is a hypervisor.
+ */
 extern "C" hv_return_t hv_vcpu_config_get_feature_reg(hv_vcpu_config_t c, hv_feature_reg_t reg, uint64_t *v) {
     if (!c || !v) return HV_BAD_ARGUMENT;
-    if ((unsigned)reg >= 2) return HV_BAD_ARGUMENT;
-    *v = c->feature_overrides[(unsigned)reg]; return HV_SUCCESS;
+
+    const ohv_capabilities_t *caps = ohv_caps_cached();
+    if (!caps) return HV_ERROR;
+    if ((unsigned)reg > 17) return HV_BAD_ARGUMENT;
+    *v = ohv_id_reg_for(caps, (unsigned)reg, true);
+    return HV_SUCCESS;
 }
 extern "C" hv_return_t hv_vcpu_config_get_ccsidr_el1_sys_reg_values(hv_vcpu_config_t c, hv_cache_type_t t, uint64_t v[8]) {
     if (!c || !v) return HV_BAD_ARGUMENT;
