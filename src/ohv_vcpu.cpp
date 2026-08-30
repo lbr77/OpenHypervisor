@@ -24,24 +24,168 @@
  * string literals and are compared by address, and a name that somehow arrives
  * at two addresses only costs a second slot.
  */
-static const char *ohv_env(const char *name) {
-    struct Entry { const char *key; const char *value; };
-    static thread_local Entry cache[128];
-    static thread_local unsigned used;
+/*
+ * Every setting this file takes from the environment, resolved once.
+ *
+ * They used to be read where they were asked, behind a thread-local cache,
+ * and a three-second sample of a vcpu running a restore put 56% of its time
+ * in that alone: a third in the cache's own scan, an eighth in
+ * `_tlv_get_addr` -- a `thread_local` in a dylib is dynamic TLS, so every
+ * touch was a call into libdyld -- and the rest still reaching getenv, whose
+ * `__findenv_locked` is a lock all six vcpu threads then queued on.  This
+ * file asks 59 questions and several are on the path of every trapped system
+ * register.
+ *
+ * They are configuration, so read them like configuration.  Twice, though,
+ * and the second time is the point: the machine sets some of them itself --
+ * OHV_TIMER_IRQ_VCPUS names the SEP's core, and it cannot know which core
+ * that is until it has built one -- so the load-time read serves whatever
+ * asks during hv_vcpu_create, and the first hv_vcpu_run picks up everything
+ * the machine added while it was starting.  No vcpu has run before then, so
+ * nothing has read a stale answer.
+ *
+ * The `cfg_` prefix keeps the fields clear of the same-named macros elsewhere
+ * in the tree.
+ */
+struct OhvCfg {
+    const char *cfg_OHV_ALLOW_APSTS_WRITE;
+    const char *cfg_OHV_AMXIDR;
+    const char *cfg_OHV_CNTHCTL;
+    const char *cfg_OHV_HACR_TACTL0;
+    const char *cfg_OHV_HCR_NESTED_MASK;
+    const char *cfg_OHV_HCR_TIDCP;
+    const char *cfg_OHV_HCR_XMO;
+    const char *cfg_OHV_IPI_UNGATED;
+    const char *cfg_OHV_IRQ_UNGATED;
+    const char *cfg_OHV_MIRROR_GL1;
+    const char *cfg_OHV_NO_EL2_INJECTION;
+    const char *cfg_OHV_NO_ERET_EMULATION;
+    const char *cfg_OHV_NO_HW_GERET;
+    const char *cfg_OHV_NO_MONITOR_NV;
+    const char *cfg_OHV_NO_NESTED_SPACE;
+    const char *cfg_OHV_NO_TWE;
+    const char *cfg_OHV_SPIN_WFI;
+    const char *cfg_OHV_SURVEY_SYSREG;
+    const char *cfg_OHV_TIMER_GATE;
+    const char *cfg_OHV_TIMER_IRQ_VCPUS;
+    const char *cfg_OHV_TRACE_AFTER;
+    const char *cfg_OHV_TRACE_ALL;
+    const char *cfg_OHV_TRACE_AT;
+    const char *cfg_OHV_TRACE_BAND;
+    const char *cfg_OHV_TRACE_CTRR;
+    const char *cfg_OHV_TRACE_ERET;
+    const char *cfg_OHV_TRACE_EXIT;
+    const char *cfg_OHV_TRACE_FAULT;
+    const char *cfg_OHV_TRACE_FIRSTRUN;
+    const char *cfg_OHV_TRACE_FROM;
+    const char *cfg_OHV_TRACE_GATE;
+    const char *cfg_OHV_TRACE_GL1;
+    const char *cfg_OHV_TRACE_GLVL;
+    const char *cfg_OHV_TRACE_GXFSTATE;
+    const char *cfg_OHV_TRACE_HACR;
+    const char *cfg_OHV_TRACE_HCR;
+    const char *cfg_OHV_TRACE_IMPDEF;
+    const char *cfg_OHV_TRACE_IRQ;
+    const char *cfg_OHV_TRACE_KFAULT;
+    const char *cfg_OHV_TRACE_KICK;
+    const char *cfg_OHV_TRACE_KIRQ;
+    const char *cfg_OHV_TRACE_KTIMER;
+    const char *cfg_OHV_TRACE_MAX;
+    const char *cfg_OHV_TRACE_NESTED;
+    const char *cfg_OHV_TRACE_ONE;
+    const char *cfg_OHV_TRACE_PAC;
+    const char *cfg_OHV_TRACE_SYSREG;
+    const char *cfg_OHV_TRACE_TID2;
+    const char *cfg_OHV_TRACE_TIMER;
+    const char *cfg_OHV_TRACE_TIMERREG;
+    const char *cfg_OHV_TRACE_TMRENA;
+    const char *cfg_OHV_TRACE_UNMATCHED;
+    const char *cfg_OHV_TRACE_USED;
+    const char *cfg_OHV_TRACE_VCPU;
+    const char *cfg_OHV_TRACE_VF;
+    const char *cfg_OHV_TRACE_VF_K;
+    const char *cfg_OHV_TRAP_GXF;
+    const char *cfg_OHV_TRY_14C8;
+    const char *cfg_OHV_VMKEY_MIRROR;
+};
 
-    for (unsigned i = 0; i < used; i++) {
-        if (cache[i].key == name) {
-            return cache[i].value;
-        }
-    }
-    const char *value = getenv(name);
-    if (used < 128) {
-        cache[used].key = name;
-        cache[used].value = value;
-        used++;
-    }
-    return value;
+static OhvCfg g_ohv_cfg;
+static std::atomic<bool> g_ohv_cfg_settled{false};
+
+static void ohv_cfg_read(void) {
+    g_ohv_cfg.cfg_OHV_ALLOW_APSTS_WRITE = getenv("OHV_ALLOW_APSTS_WRITE");
+    g_ohv_cfg.cfg_OHV_AMXIDR = getenv("OHV_AMXIDR");
+    g_ohv_cfg.cfg_OHV_CNTHCTL = getenv("OHV_CNTHCTL");
+    g_ohv_cfg.cfg_OHV_HACR_TACTL0 = getenv("OHV_HACR_TACTL0");
+    g_ohv_cfg.cfg_OHV_HCR_NESTED_MASK = getenv("OHV_HCR_NESTED_MASK");
+    g_ohv_cfg.cfg_OHV_HCR_TIDCP = getenv("OHV_HCR_TIDCP");
+    g_ohv_cfg.cfg_OHV_HCR_XMO = getenv("OHV_HCR_XMO");
+    g_ohv_cfg.cfg_OHV_IPI_UNGATED = getenv("OHV_IPI_UNGATED");
+    g_ohv_cfg.cfg_OHV_IRQ_UNGATED = getenv("OHV_IRQ_UNGATED");
+    g_ohv_cfg.cfg_OHV_MIRROR_GL1 = getenv("OHV_MIRROR_GL1");
+    g_ohv_cfg.cfg_OHV_NO_EL2_INJECTION = getenv("OHV_NO_EL2_INJECTION");
+    g_ohv_cfg.cfg_OHV_NO_ERET_EMULATION = getenv("OHV_NO_ERET_EMULATION");
+    g_ohv_cfg.cfg_OHV_NO_HW_GERET = getenv("OHV_NO_HW_GERET");
+    g_ohv_cfg.cfg_OHV_NO_MONITOR_NV = getenv("OHV_NO_MONITOR_NV");
+    g_ohv_cfg.cfg_OHV_NO_NESTED_SPACE = getenv("OHV_NO_NESTED_SPACE");
+    g_ohv_cfg.cfg_OHV_NO_TWE = getenv("OHV_NO_TWE");
+    g_ohv_cfg.cfg_OHV_SPIN_WFI = getenv("OHV_SPIN_WFI");
+    g_ohv_cfg.cfg_OHV_SURVEY_SYSREG = getenv("OHV_SURVEY_SYSREG");
+    g_ohv_cfg.cfg_OHV_TIMER_GATE = getenv("OHV_TIMER_GATE");
+    g_ohv_cfg.cfg_OHV_TIMER_IRQ_VCPUS = getenv("OHV_TIMER_IRQ_VCPUS");
+    g_ohv_cfg.cfg_OHV_TRACE_AFTER = getenv("OHV_TRACE_AFTER");
+    g_ohv_cfg.cfg_OHV_TRACE_ALL = getenv("OHV_TRACE_ALL");
+    g_ohv_cfg.cfg_OHV_TRACE_AT = getenv("OHV_TRACE_AT");
+    g_ohv_cfg.cfg_OHV_TRACE_BAND = getenv("OHV_TRACE_BAND");
+    g_ohv_cfg.cfg_OHV_TRACE_CTRR = getenv("OHV_TRACE_CTRR");
+    g_ohv_cfg.cfg_OHV_TRACE_ERET = getenv("OHV_TRACE_ERET");
+    g_ohv_cfg.cfg_OHV_TRACE_EXIT = getenv("OHV_TRACE_EXIT");
+    g_ohv_cfg.cfg_OHV_TRACE_FAULT = getenv("OHV_TRACE_FAULT");
+    g_ohv_cfg.cfg_OHV_TRACE_FIRSTRUN = getenv("OHV_TRACE_FIRSTRUN");
+    g_ohv_cfg.cfg_OHV_TRACE_FROM = getenv("OHV_TRACE_FROM");
+    g_ohv_cfg.cfg_OHV_TRACE_GATE = getenv("OHV_TRACE_GATE");
+    g_ohv_cfg.cfg_OHV_TRACE_GL1 = getenv("OHV_TRACE_GL1");
+    g_ohv_cfg.cfg_OHV_TRACE_GLVL = getenv("OHV_TRACE_GLVL");
+    g_ohv_cfg.cfg_OHV_TRACE_GXFSTATE = getenv("OHV_TRACE_GXFSTATE");
+    g_ohv_cfg.cfg_OHV_TRACE_HACR = getenv("OHV_TRACE_HACR");
+    g_ohv_cfg.cfg_OHV_TRACE_HCR = getenv("OHV_TRACE_HCR");
+    g_ohv_cfg.cfg_OHV_TRACE_IMPDEF = getenv("OHV_TRACE_IMPDEF");
+    g_ohv_cfg.cfg_OHV_TRACE_IRQ = getenv("OHV_TRACE_IRQ");
+    g_ohv_cfg.cfg_OHV_TRACE_KFAULT = getenv("OHV_TRACE_KFAULT");
+    g_ohv_cfg.cfg_OHV_TRACE_KICK = getenv("OHV_TRACE_KICK");
+    g_ohv_cfg.cfg_OHV_TRACE_KIRQ = getenv("OHV_TRACE_KIRQ");
+    g_ohv_cfg.cfg_OHV_TRACE_KTIMER = getenv("OHV_TRACE_KTIMER");
+    g_ohv_cfg.cfg_OHV_TRACE_MAX = getenv("OHV_TRACE_MAX");
+    g_ohv_cfg.cfg_OHV_TRACE_NESTED = getenv("OHV_TRACE_NESTED");
+    g_ohv_cfg.cfg_OHV_TRACE_ONE = getenv("OHV_TRACE_ONE");
+    g_ohv_cfg.cfg_OHV_TRACE_PAC = getenv("OHV_TRACE_PAC");
+    g_ohv_cfg.cfg_OHV_TRACE_SYSREG = getenv("OHV_TRACE_SYSREG");
+    g_ohv_cfg.cfg_OHV_TRACE_TID2 = getenv("OHV_TRACE_TID2");
+    g_ohv_cfg.cfg_OHV_TRACE_TIMER = getenv("OHV_TRACE_TIMER");
+    g_ohv_cfg.cfg_OHV_TRACE_TIMERREG = getenv("OHV_TRACE_TIMERREG");
+    g_ohv_cfg.cfg_OHV_TRACE_TMRENA = getenv("OHV_TRACE_TMRENA");
+    g_ohv_cfg.cfg_OHV_TRACE_UNMATCHED = getenv("OHV_TRACE_UNMATCHED");
+    g_ohv_cfg.cfg_OHV_TRACE_USED = getenv("OHV_TRACE_USED");
+    g_ohv_cfg.cfg_OHV_TRACE_VCPU = getenv("OHV_TRACE_VCPU");
+    g_ohv_cfg.cfg_OHV_TRACE_VF = getenv("OHV_TRACE_VF");
+    g_ohv_cfg.cfg_OHV_TRACE_VF_K = getenv("OHV_TRACE_VF_K");
+    g_ohv_cfg.cfg_OHV_TRAP_GXF = getenv("OHV_TRAP_GXF");
+    g_ohv_cfg.cfg_OHV_TRY_14C8 = getenv("OHV_TRY_14C8");
+    g_ohv_cfg.cfg_OHV_VMKEY_MIRROR = getenv("OHV_VMKEY_MIRROR");
 }
+
+__attribute__((constructor)) static void ohv_cfg_init(void) {
+    ohv_cfg_read();
+}
+
+static inline void ohv_cfg_settle(void) {
+    if (!g_ohv_cfg_settled.load(std::memory_order_relaxed)) {
+        ohv_cfg_read();
+        g_ohv_cfg_settled.store(true, std::memory_order_relaxed);
+    }
+}
+
+#define ohv_env(name) (g_ohv_cfg.cfg_##name)
 
 /* Set once the guest's PC first lands in the kernel; defined below. */
 extern bool g_kernel_running;
@@ -410,7 +554,7 @@ static bool service_nv2_access(VcpuSlot *s, uint64_t esr) {
      * three thousand entries at the same instruction without retiring it.
      */
     if (op0 == 3 && op1 == 6 && crn == 15 && crm == 2 && op2 == 7 && read) {
-        const char *want = ohv_env("OHV_AMXIDR");
+        const char *want = ohv_env(OHV_AMXIDR);
         uint64_t v = want ? strtoull(want, nullptr, 0) : 1;
         ohv_rw_page_head_t *rw = ohv_rw(s->ctx);
 
@@ -433,7 +577,7 @@ static bool service_nv2_access(VcpuSlot *s, uint64_t esr) {
         ohv_rw_controls(s->ctx)->hcr_el2 |= OHV_HCR_NV;
         mark_dirty(s->ctx, OHV_STATE_CONTROLS);
         s->guest_at_el2 = true;
-        if (ohv_env("OHV_TRACE_ERET")) {
+        if (ohv_env(OHV_TRACE_ERET)) {
             fprintf(stderr, "[ohv] handoff: monitor next, NV armed, hcr %#llx\n",
                     (unsigned long long)ohv_rw_controls(s->ctx)->hcr_el2);
         }
@@ -467,7 +611,7 @@ static bool service_nv2_access(VcpuSlot *s, uint64_t esr) {
             *slot = (rt == 31) ? 0 : rw->regs.x[rt];
             mark_dirty(s->ctx, OHV_STATE_GXF);
         }
-        if (ohv_env("OHV_TRACE_ERET")) {
+        if (ohv_env(OHV_TRACE_ERET)) {
             fprintf(stderr, "[ohv] gxf %s ext[%u] = %#llx pc %#llx\n",
                     read ? "read" : "write", ext,
                     (unsigned long long)*slot,
@@ -522,7 +666,7 @@ static bool service_nv2_access(VcpuSlot *s, uint64_t esr) {
                               : caps.ccsidr_el1_data_or_unified[level];
         }
         if (read && rt != 31) rw->regs.x[rt] = v;
-        if (ohv_env("OHV_TRACE_TID2")) {
+        if (ohv_env(OHV_TRACE_TID2)) {
             fprintf(stderr, "[ohv] tid2 %s op1=%u op2=%u csselr %#llx"
                     " -> %#llx pc %#llx\n", read ? "read" : "write", op1, op2,
                     (unsigned long long)*csselr, (unsigned long long)v,
@@ -583,7 +727,7 @@ static bool service_nv2_access(VcpuSlot *s, uint64_t esr) {
          * again -- and arming with a deadline still in the future moves no
          * edge at all, so it is invisible from there.
          */
-        if (ohv_env("OHV_TRACE_TIMERREG") && !read && physical) {
+        if (ohv_env(OHV_TRACE_TIMERREG) && !read && physical) {
             fprintf(stderr, "[ohv] cntp %s = %#llx pc %#llx\n",
                     op2 == 0 ? "tval" : (op2 == 1 ? "ctl " : "cval"),
                     (unsigned long long)(rt == 31 ? 0
@@ -676,7 +820,7 @@ static bool service_nv2_access(VcpuSlot *s, uint64_t esr) {
      * handing over the machine becomes an exception the guest takes with no
      * vector table to take it with.
      */
-    if (ohv_env("OHV_TRACE_AT") && op0 == 1 && crn == 7) {
+    if (ohv_env(OHV_TRACE_AT) && op0 == 1 && crn == 7) {
         fprintf(stderr, "[ohv] vcpu %llu system insn op1=%u crn=%u crm=%u"
                 " op2=%u rt=%u pc=%#llx\n", (unsigned long long)s->id,
                 op1, crn, crm, op2, rt,
@@ -825,7 +969,7 @@ static bool service_nv2_access(VcpuSlot *s, uint64_t esr) {
              * turns it off, and whether the same one ever turns it on.  These
              * writes are rare enough that a budget would only hide them.
              */
-            if (ohv_env("OHV_TRACE_TMRENA")) {
+            if (ohv_env(OHV_TRACE_TMRENA)) {
                 fprintf(stderr, "[ohv] vm_tmr_fiq_ena %#llx -> %#llx"
                         " pc %#llx\n", (unsigned long long)was,
                         (unsigned long long)s->vm_tmr_fiq_ena,
@@ -893,7 +1037,7 @@ static bool service_nv2_access(VcpuSlot *s, uint64_t esr) {
         } else {
             s->ctrr[i].value = (rt == 31) ? 0 : rw->regs.x[rt];
         }
-        if (ohv_env("OHV_TRACE_CTRR")) {
+        if (ohv_env(OHV_TRACE_CTRR)) {
             fprintf(stderr, "[ohv] ctrr %s c%u_%u slot %u = %#llx pc %#llx\n",
                     read ? "read " : "write", crm, op2, slot,
                     (unsigned long long)s->ctrr[i].value,
@@ -987,7 +1131,7 @@ static bool service_nv2_access(VcpuSlot *s, uint64_t esr) {
         } else {
             s->apple_shadow[i].value = (rt == 31) ? 0 : rw->regs.x[rt];
         }
-        if (ohv_env("OHV_TRACE_IMPDEF")) {
+        if (ohv_env(OHV_TRACE_IMPDEF)) {
             fprintf(stderr, "[ohv] impdef %s s3_%u_c15_c%u_%u = %#llx pc %#llx\n",
                     read ? "read " : "write", op1, crm, op2,
                     (unsigned long long)s->apple_shadow[i].value,
@@ -1013,7 +1157,7 @@ static bool service_nv2_access(VcpuSlot *s, uint64_t esr) {
      * worth knowing is the order: which of them is written, with what, and
      * where the authentication that fails sits among them.
      */
-    if (ohv_env("OHV_TRACE_PAC") && op0 == 3 && op1 == 4 && crn == 15 &&
+    if (ohv_env(OHV_TRACE_PAC) && op0 == 3 && op1 == 4 && crn == 15 &&
         ((crm == 0 && op2 == 4) || (crm == 1 && op2 < 2))) {
         static const char *const name[] = { "KERNELKEYLO", "KERNELKEYHI" };
         ohv_rw_page_head_t *rw = ohv_rw(s->ctx);
@@ -1029,7 +1173,7 @@ static bool service_nv2_access(VcpuSlot *s, uint64_t esr) {
     const Nv2Reg *r = (op1 == 4 && op0 == 3) ? nv2_lookup(enc) : nullptr;
 
     if (!r) {
-        if (ohv_env("OHV_TRACE_UNMATCHED")) {
+        if (ohv_env(OHV_TRACE_UNMATCHED)) {
             static unsigned n;
 
             if (n < 40) {
@@ -1206,7 +1350,7 @@ static void enter_guest_el2(VcpuSlot *s, uint64_t esr, uint64_t return_pc) {
 static ExitAction exit_from_ro(VcpuSlot *s) {
     volatile ohv_vmexit_info_t *e = ohv_exit_info(s->ctx);
 
-    if (ohv_env("OHV_TRACE_HCR")) {
+    if (ohv_env(OHV_TRACE_HCR)) {
         static unsigned shown[8];
 
         if (s->id < 8 && shown[s->id] < 40 && e->vmexit_reason != 6 &&
@@ -1229,7 +1373,7 @@ static ExitAction exit_from_ro(VcpuSlot *s) {
                     (unsigned long long)*ohv_rw_u64(s->ctx, OHV_RW_TIMER));
         }
     }
-    if (ohv_env("OHV_TRACE_ALL")) {
+    if (ohv_env(OHV_TRACE_ALL)) {
         uint64_t tpc = ohv_rw(s->ctx)->regs.pc;
         /*
          * Tracing every exit costs more than the guest does, so a run under it
@@ -1237,7 +1381,7 @@ static ExitAction exit_from_ro(VcpuSlot *s) {
          * firmware has had its uninteresting seconds.
          */
         static time_t t0;
-        const char *after = ohv_env("OHV_TRACE_AFTER");
+        const char *after = ohv_env(OHV_TRACE_AFTER);
         bool armed = true;
 
         if (!t0) t0 = time(nullptr);
@@ -1245,7 +1389,7 @@ static ExitAction exit_from_ro(VcpuSlot *s) {
         static uint64_t floor = ~0ull;
 
         if (floor == ~0ull) {
-            const char *f = ohv_env("OHV_TRACE_FROM");
+            const char *f = ohv_env(OHV_TRACE_FROM);
 
             floor = f ? strtoull(f, nullptr, 0) : 0x1fc000000ull;
         }
@@ -1253,14 +1397,14 @@ static ExitAction exit_from_ro(VcpuSlot *s) {
         static unsigned cap = 0;
 
         if (!cap) {
-            const char *c = ohv_env("OHV_TRACE_MAX");
+            const char *c = ohv_env(OHV_TRACE_MAX);
 
             cap = c ? (unsigned)atoi(c) : ~0u;
         }
         static long only = -2;
 
         if (only == -2) {
-            const char *o = ohv_env("OHV_TRACE_VCPU");
+            const char *o = ohv_env(OHV_TRACE_VCPU);
 
             only = o ? strtol(o, nullptr, 0) : -1;
         }
@@ -1290,7 +1434,7 @@ static ExitAction exit_from_ro(VcpuSlot *s) {
         ohv_rw_controls(s->ctx)->hcr_el2 |= OHV_HCR_NV;
         mark_dirty(s->ctx, OHV_STATE_CONTROLS);
         s->nv_off_for_geret = false;
-        if (ohv_env("OHV_TRACE_ERET")) {
+        if (ohv_env(OHV_TRACE_ERET)) {
             fprintf(stderr, "[ohv] guarded exit: NV restored at pc %#llx\n",
                     (unsigned long long)ohv_rw(s->ctx)->regs.pc);
         }
@@ -1301,7 +1445,7 @@ static ExitAction exit_from_ro(VcpuSlot *s) {
      * to know where the guest landed is to look afterwards -- and SPTM's own
      * guarded lower-EL handler is the thing that notices when it is wrong.
      */
-    if (ohv_env("OHV_TRACE_GLVL") && s->nv_off_for_geret) {
+    if (ohv_env(OHV_TRACE_GLVL) && s->nv_off_for_geret) {
         static unsigned n;
 
         if (n < 12) {
@@ -1337,7 +1481,7 @@ static ExitAction exit_from_ro(VcpuSlot *s) {
      * MDSCR_EL1, APCTL_EL1 and SCTLR_EL1 between setting the pair and the
      * ERET, and those do trap.
      */
-    if (ohv_env("OHV_MIRROR_GL1") &&
+    if (ohv_env(OHV_MIRROR_GL1) &&
         ((e->vmexit_esr >> 26) & 0x3f) == 0x18) {
         ohv_raw_trap(OHV_TRAP_VCPU_SYSREGS_SYNC, nullptr);
         uint64_t gelr = *ohv_rw_u64(s->ctx, OHV_RW_EXTREGS + 51 * 8);
@@ -1353,7 +1497,7 @@ static ExitAction exit_from_ro(VcpuSlot *s) {
                 *elr = gelr;
                 *spsr = gspsr;
                 mark_dirty(s->ctx, OHV_STATE_SYSREGS);
-                if (ohv_env("OHV_TRACE_ERET")) {
+                if (ohv_env(OHV_TRACE_ERET)) {
                     static unsigned n;
 
                     if (n < 8) {
@@ -1374,7 +1518,7 @@ static ExitAction exit_from_ro(VcpuSlot *s) {
      * bit when it services a trapped GXF_CONFIG/ENTRY/PABENTRY access -- so
      * this says, in one word, whether the traps we asked for are happening.
      */
-    if (ohv_env("OHV_TRACE_GXFSTATE")) {
+    if (ohv_env(OHV_TRACE_GXFSTATE)) {
         static unsigned n;
 
         static uint64_t last = ~0ull;
@@ -1410,12 +1554,12 @@ static ExitAction exit_from_ro(VcpuSlot *s) {
      * an instruction abort on its first fetch.  The difference is only whether
      * NV happened to still be set, which is why it worked once and not again.
      */
-    if (!ohv_env("OHV_NO_MONITOR_NV") &&
+    if (!ohv_env(OHV_NO_MONITOR_NV) &&
         ohv_rw(s->ctx)->regs.pc >= 0xfffffff000000000ull &&
         (ohv_rw_controls(s->ctx)->hcr_el2 & OHV_HCR_NV) == 0) {
         ohv_rw_controls(s->ctx)->hcr_el2 |= OHV_HCR_NV;
         mark_dirty(s->ctx, OHV_STATE_CONTROLS);
-        if (ohv_env("OHV_TRACE_ERET")) {
+        if (ohv_env(OHV_TRACE_ERET)) {
             fprintf(stderr, "[ohv] NV re-armed for the monitor at pc %#llx\n",
                     (unsigned long long)ohv_rw(s->ctx)->regs.pc);
         }
@@ -1427,7 +1571,7 @@ static ExitAction exit_from_ro(VcpuSlot *s) {
      * address, ESR_EL1 why.  Printed when the reason changes, so a loop says
      * so once rather than a million times.
      */
-    if (ohv_env("OHV_TRACE_KFAULT") &&
+    if (ohv_env(OHV_TRACE_KFAULT) &&
         ohv_rw(s->ctx)->regs.pc >= 0xfffffff000000000ull) {
         static uint64_t last_esr = ~0ull;
         uint64_t esr = *ohv_rw_u64(s->ctx, OHV_RW_BANKED_SYSREGS + 5 * 8);
@@ -1485,7 +1629,7 @@ static ExitAction exit_from_ro(VcpuSlot *s) {
          * one it dies on appears later, and only a level check catches the
          * moment it does.
          */
-        if (ohv_env("OHV_TRACE_KTIMER")) {
+        if (ohv_env(OHV_TRACE_KTIMER)) {
             uint64_t h = ohv_rw_controls(s->ctx)->hcr_el2;
 
             /*
@@ -1502,7 +1646,7 @@ static ExitAction exit_from_ro(VcpuSlot *s) {
                         (h & (1ull << 7)) ? 1 : 0, (h & (1ull << 6)) ? 1 : 0);
             }
         }
-        if (ohv_env("OHV_TRACE_KTIMER") && g_kernel_running) {
+        if (ohv_env(OHV_TRACE_KTIMER) && g_kernel_running) {
             static unsigned n;
 
             if (n < 8) {
@@ -1538,7 +1682,7 @@ static ExitAction exit_from_ro(VcpuSlot *s) {
             }
         }
     }
-    if (ohv_env("OHV_TRACE_FAULT")) {
+    if (ohv_env(OHV_TRACE_FAULT)) {
         static uint64_t last_esr, last_elr;
         uint64_t esr = *ohv_rw_u64(s->ctx, OHV_RW_BANKED_SYSREGS + 5 * 8);
 
@@ -1673,7 +1817,7 @@ static ExitAction exit_from_ro(VcpuSlot *s) {
             return EXIT_KEEP_RUNNING;
 
         case 3: case 4: {
-            if (ohv_env("OHV_TRACE_IRQ")) {
+            if (ohv_env(OHV_TRACE_IRQ)) {
                 static unsigned n;
 
                 if (n < 10) {
@@ -1726,7 +1870,7 @@ static ExitAction exit_from_ro(VcpuSlot *s) {
              * the instruction says whether the guest is waiting to be woken
              * or waiting for something that never happens.
              */
-            if (ohv_env("OHV_SPIN_WFI") &&
+            if (ohv_env(OHV_SPIN_WFI) &&
                 ((e->vmexit_esr >> 26) & 0x3f) == 0x1) {
                 ohv_rw(s->ctx)->regs.pc += 4;
                 return EXIT_KEEP_RUNNING;
@@ -1737,16 +1881,16 @@ static ExitAction exit_from_ro(VcpuSlot *s) {
              * VMM's, so it goes to its vector table.
              */
             if (((e->vmexit_esr >> 26) & 0x3f) == 0x16 && !s->guest_at_el2 &&
-                !ohv_env("OHV_NO_EL2_INJECTION")) {
+                !ohv_env(OHV_NO_EL2_INJECTION)) {
                 enter_guest_el2(s, e->vmexit_esr, ohv_rw(s->ctx)->regs.pc + 4);
-                if (ohv_env("OHV_TRACE_ERET")) {
+                if (ohv_env(OHV_TRACE_ERET)) {
                     fprintf(stderr, "[ohv] vcpu %llu hvc -> guest EL2 vector"
                             " %#llx\n", (unsigned long long)s->id,
                             (unsigned long long)ohv_rw(s->ctx)->regs.pc);
                 }
                 return EXIT_KEEP_RUNNING;
             }
-            if (ohv_env("OHV_TRACE_GL1") &&
+            if (ohv_env(OHV_TRACE_GL1) &&
                 ((e->vmexit_esr >> 26) & 0x3f) == 0x1a) {
                 static unsigned n;
                 /* Only the monitors' own returns; the earlier ones are the
@@ -1770,7 +1914,7 @@ static ExitAction exit_from_ro(VcpuSlot *s) {
                     }
                 }
             }
-            if (ohv_env("OHV_TRACE_ERET") &&
+            if (ohv_env(OHV_TRACE_ERET) &&
                 ((e->vmexit_esr >> 26) & 0x3f) == 0x1a) {
                 fprintf(stderr, "[ohv] vcpu %llu EC 0x1a: esr %#llx"
                         " at_el2 %d spsr_gl1 %#llx elr %#llx spsr %#llx"
@@ -1812,7 +1956,7 @@ static ExitAction exit_from_ro(VcpuSlot *s) {
              * lower level and SPTM deadloops.  Letting the silicon do the
              * transition is the whole point, so the switch only turns it off.
              */
-            if (!ohv_env("OHV_NO_HW_GERET") &&
+            if (!ohv_env(OHV_NO_HW_GERET) &&
                 ((e->vmexit_esr >> 26) & 0x3f) == 0x1a &&
                 (e->vmexit_esr & 1) == 0) {
                 uint64_t gspsr = 0;
@@ -1829,7 +1973,7 @@ static ExitAction exit_from_ro(VcpuSlot *s) {
                     ohv_rw_controls(s->ctx)->hcr_el2 &= ~OHV_HCR_NV;
                     mark_dirty(s->ctx, OHV_STATE_CONTROLS);
                     s->nv_off_for_geret = true;
-                    if (ohv_env("OHV_TRACE_ERET")) {
+                    if (ohv_env(OHV_TRACE_ERET)) {
                         fprintf(stderr, "[ohv] guarded ERET left to the"
                                 " hardware: elr %#llx spsr %#llx pc %#llx\n",
                                 (unsigned long long)gelr,
@@ -1850,7 +1994,7 @@ static ExitAction exit_from_ro(VcpuSlot *s) {
             if (((e->vmexit_esr >> 26) & 0x3f) == 0x1a &&
                 (e->vmexit_esr & 1) == 0 && s->guest_at_el2 &&
                 !eret_is_guarded(s, nullptr) &&
-                !ohv_env("OHV_NO_ERET_EMULATION")) {
+                !ohv_env(OHV_NO_ERET_EMULATION)) {
                 ohv_rw_page_head_t *rw = ohv_rw(s->ctx);
                 /*
                  * The return pair is the hardware's ELR_EL1 and SPSR_EL1, not
@@ -1898,7 +2042,7 @@ static ExitAction exit_from_ro(VcpuSlot *s) {
                     s->guest_at_el2 = false;
                     ohv_rw_controls(s->ctx)->hcr_el2 &= ~OHV_HCR_NV;
                     mark_dirty(s->ctx, OHV_STATE_CONTROLS);
-                    if (ohv_env("OHV_TRACE_ERET")) {
+                    if (ohv_env(OHV_TRACE_ERET)) {
                         fprintf(stderr, "[ohv] vcpu %llu eret -> %#llx spsr"
                                 " %#llx, NV cleared, hcr now %#llx\n",
                                 (unsigned long long)s->id,
@@ -1909,7 +2053,7 @@ static ExitAction exit_from_ro(VcpuSlot *s) {
                 } else if (mode == 0x8 || mode == 0x9) {
                     /* Staying at EL2 means staying at hardware EL1. */
                     rw->regs.cpsr = (uint32_t)((spsr & ~0xfu) | (mode - 4));
-                    if (ohv_env("OHV_TRACE_ERET")) {
+                    if (ohv_env(OHV_TRACE_ERET)) {
                         fprintf(stderr, "[ohv] vcpu %llu eret stays at EL2"
                                 " -> %#llx spsr %#llx\n",
                                 (unsigned long long)s->id,
@@ -1947,7 +2091,7 @@ static ExitAction exit_from_ro(VcpuSlot *s) {
             return EXIT_TO_VMM;
 
         default:
-            if (ohv_env("OHV_TRACE_EXIT")) {
+            if (ohv_env(OHV_TRACE_EXIT)) {
                 fprintf(stderr, "openhyp: kernel vmexit reason %u, esr %#llx"
                         " far %#llx hpfar %#llx pc %#llx -- not classified\n",
                         reason, (unsigned long long)e->vmexit_esr,
@@ -1998,7 +2142,7 @@ extern "C" hv_return_t hv_vcpu_create(hv_vcpu_t *vcpu_out, hv_vcpu_exit_t **exit
          * kernel has an ordinary EL1 guest and refuses anything else.
          */
         volatile uint64_t *controls = (volatile uint64_t *)ohv_rw_controls(s.ctx);
-        const char *mask = ohv_env("OHV_HCR_NESTED_MASK");
+        const char *mask = ohv_env(OHV_HCR_NESTED_MASK);
         uint64_t hcr = controls[0] |
             (mask ? strtoull(mask, nullptr, 0) : OHV_HCR_NESTED);
 
@@ -2049,7 +2193,7 @@ extern "C" hv_return_t hv_vcpu_create(hv_vcpu_t *vcpu_out, hv_vcpu_exit_t **exit
          * gate can always say yes to.  OHV_NO_TWE=1 puts the old behaviour
          * back.
          */
-        if (!ohv_env("OHV_NO_TWE")) {
+        if (!ohv_env(OHV_NO_TWE)) {
             hcr |= OHV_HCR_TWE;
         }
         /*
@@ -2072,21 +2216,21 @@ extern "C" hv_return_t hv_vcpu_create(hv_vcpu_t *vcpu_out, hv_vcpu_exit_t **exit
          * they are saved and restored per vCPU; everything it does not
          * recognise still falls through to the VMM.
          */
-        if (const char *t = ohv_env("OHV_HCR_TIDCP")) {
+        if (const char *t = ohv_env(OHV_HCR_TIDCP)) {
             if (strtoull(t, nullptr, 0) == 0) {
                 hcr &= ~OHV_HCR_TIDCP;
             } else {
                 hcr |= OHV_HCR_TIDCP;
             }
         }
-        if (const char *o = ohv_env("OHV_HCR_XMO")) {
+        if (const char *o = ohv_env(OHV_HCR_XMO)) {
             uint64_t m = OHV_HCR_AMO | OHV_HCR_IMO | OHV_HCR_FMO;
 
             hcr = (hcr & ~m) | (strtoull(o, nullptr, 0) & m);
         }
         controls[0] = hcr;
         controls[1] = OHV_HACR_APPLE_DEFAULT;
-        if (ohv_env("OHV_HACR_TACTL0")) {
+        if (ohv_env(OHV_HACR_TACTL0)) {
             /*
              * The trap that decides whether the kernel or this library owns
              * APCTL_EL1 -- and with it whether the Apple pointer-auth
@@ -2107,7 +2251,7 @@ extern "C" hv_return_t hv_vcpu_create(hv_vcpu_t *vcpu_out, hv_vcpu_exit_t **exit
          * unfamiliar shape appeared.  The GENTER boundary is not observable
          * from this side.
          */
-        if (ohv_env("OHV_TRAP_GXF")) {
+        if (ohv_env(OHV_TRAP_GXF)) {
             controls[1] |= OHV_HACR_TGXF;
         }
         /*
@@ -2143,21 +2287,21 @@ extern "C" hv_return_t hv_vcpu_create(hv_vcpu_t *vcpu_out, hv_vcpu_exit_t **exit
              */
             uint64_t v = (*ch & ~0x1fc00ull) | 0x1e000ull;
 
-            if (const char *o = ohv_env("OHV_CNTHCTL")) {
+            if (const char *o = ohv_env(OHV_CNTHCTL)) {
                 v = strtoull(o, nullptr, 0);
             }
-            if (ohv_env("OHV_TRACE_TIMER")) {
+            if (ohv_env(OHV_TRACE_TIMER)) {
                 fprintf(stderr, "[ohv] cnthctl_el2 %#llx -> %#llx\n",
                         (unsigned long long)*ch, (unsigned long long)v);
             }
             *ch = v;
         }
         mark_dirty(s.ctx, OHV_STATE_CONTROLS);
-        if (ohv_env("OHV_TRACE_HACR")) {
+        if (ohv_env(OHV_TRACE_HACR)) {
             fprintf(stderr, "[ohv] hacr asked %#llx\n",
                     (unsigned long long)controls[1]);
         }
-        if (ohv_env("OHV_TRACE_USED")) {
+        if (ohv_env(OHV_TRACE_USED)) {
             /*
              * What the kernel says it is carrying.  The Apple pointer-auth
              * registers reach the silicon only from
@@ -2181,7 +2325,7 @@ extern "C" hv_return_t hv_vcpu_create(hv_vcpu_t *vcpu_out, hv_vcpu_exit_t **exit
          * model refuses the value rather than building a 32-bit guest.
          */
         *ohv_rw_u64(s.ctx, OHV_NESTED_HCR_EL2) = 0x80000000ull;
-        if (const char *w = ohv_env("OHV_TRY_14C8")) {
+        if (const char *w = ohv_env(OHV_TRY_14C8)) {
             *ohv_rw_u64(s.ctx, 0x14c8) = strtoull(w, nullptr, 0);
         }
     }
@@ -2205,7 +2349,7 @@ extern "C" hv_return_t hv_vcpu_create(hv_vcpu_t *vcpu_out, hv_vcpu_exit_t **exit
      * same trap.  Without it the kernel has nowhere to put guest EL2 and
      * refuses the first run as illegal guest state.
      */
-    if (ohv::g_vm_el2 && !ohv_env("OHV_NO_NESTED_SPACE")) {
+    if (ohv::g_vm_el2 && !ohv_env(OHV_NO_NESTED_SPACE)) {
         /*
          * One space per vCPU, not one space for all of them.  Guest EL2 state
          * lives in the space -- that is where the kernel puts the page the
@@ -2225,7 +2369,7 @@ extern "C" hv_return_t hv_vcpu_create(hv_vcpu_t *vcpu_out, hv_vcpu_exit_t **exit
                     (unsigned long long)s.id);
             asid = ohv_nested_asid(0);
         }
-        if (ohv_env("OHV_TRACE_NESTED")) {
+        if (ohv_env(OHV_TRACE_NESTED)) {
             fprintf(stderr, "[ohv] vcpu %llu joining nested space %#llx\n",
                     (unsigned long long)s.id, (unsigned long long)asid);
         }
@@ -2233,7 +2377,7 @@ extern "C" hv_return_t hv_vcpu_create(hv_vcpu_t *vcpu_out, hv_vcpu_exit_t **exit
             hv_return_t sr = ohv_raw_trap(OHV_TRAP_VCPU_SET_ADDRESS_SPACE,
                                           (void *)(uintptr_t)asid);
 
-            if (ohv_env("OHV_TRACE_NESTED")) {
+            if (ohv_env(OHV_TRACE_NESTED)) {
                 fprintf(stderr, "[ohv] join rc %#x\n", sr);
             }
             if (sr != HV_SUCCESS) {
@@ -2491,7 +2635,7 @@ static hv_return_t sysreg_access(hv_vcpu_t id, uint16_t enc, uint64_t *value, bo
          * something else now.
          */
         if ((enc == 0xe788 || enc == 0xe789) &&
-            ohv_env("OHV_VMKEY_MIRROR")) {
+            ohv_env(OHV_VMKEY_MIRROR)) {
             volatile ohv_controls_t *c = ohv_rw_controls(s->ctx);
 
             if (enc == 0xe788) {
@@ -2500,7 +2644,7 @@ static hv_return_t sysreg_access(hv_vcpu_t id, uint16_t enc, uint64_t *value, bo
                 c->vmkeyhi_el2 = out;
             }
             mark_dirty(s->ctx, OHV_STATE_CONTROLS);
-            if (ohv_env("OHV_TRACE_PAC")) {
+            if (ohv_env(OHV_TRACE_PAC)) {
                 fprintf(stderr, "[ohv] vcpu %llu vmkey %s <- %#llx\n",
                         (unsigned long long)s->id,
                         enc == 0xe788 ? "lo" : "hi",
@@ -2511,8 +2655,8 @@ static hv_return_t sysreg_access(hv_vcpu_t id, uint16_t enc, uint64_t *value, bo
     } else {
         *value = *p;
     }
-    if (ohv_env("OHV_TRACE_ONE")) {
-        unsigned want = (unsigned)strtoul(ohv_env("OHV_TRACE_ONE"), nullptr, 0);
+    if (ohv_env(OHV_TRACE_ONE)) {
+        unsigned want = (unsigned)strtoul(ohv_env(OHV_TRACE_ONE), nullptr, 0);
 
         if (enc == want) {
             fprintf(stderr, "openhyp: %s %#06x kind %u index %u at +%#llx"
@@ -2540,7 +2684,7 @@ extern "C" hv_return_t hv_vcpu_get_sys_reg(hv_vcpu_t id, hv_sys_reg_t reg, uint6
  */
 static void trace_sysreg_refusal(const char *what, uint16_t reg,
                                  uint64_t value, hv_return_t r) {
-    if (r == HV_SUCCESS || !ohv_env("OHV_TRACE_SYSREG")) {
+    if (r == HV_SUCCESS || !ohv_env(OHV_TRACE_SYSREG)) {
         return;
     }
     fprintf(stderr, "openhyp: %s of sysreg %#06x (op0=%u op1=%u crn=%u crm=%u"
@@ -2559,7 +2703,7 @@ extern "C" hv_return_t hv_vcpu_set_sys_reg(hv_vcpu_t id, hv_sys_reg_t reg, uint6
      * refused, so the caller carries on and every gap gets named.  It leaves
      * the guest missing that state, so it is a survey and nothing else.
      */
-    if (r == HV_UNSUPPORTED && ohv_env("OHV_SURVEY_SYSREG")) {
+    if (r == HV_UNSUPPORTED && ohv_env(OHV_SURVEY_SYSREG)) {
         return HV_SUCCESS;
     }
     return r;
@@ -2622,7 +2766,7 @@ extern "C" hv_return_t hv_vcpu_set_pending_interrupt(hv_vcpu_t id, hv_interrupt_
      * fatal.  Whether the first one is an IRQ or an FIQ says whether it came
      * from the interrupt controller or from the CPU timer this side drives.
      */
-    if (ohv_env("OHV_TRACE_KIRQ")) {
+    if (ohv_env(OHV_TRACE_KIRQ)) {
         static bool was[64][2];
         static unsigned n;
         unsigned slot = (unsigned)s->id < 64 ? (unsigned)s->id : 0;
@@ -2655,7 +2799,7 @@ extern "C" hv_return_t hv_vcpu_set_pending_interrupt(hv_vcpu_t id, hv_interrupt_
      * budget hides the one at the end, which is the only one a stall is
      * about.
      */
-    if (ohv_env("OHV_TRACE_IRQ")) {
+    if (ohv_env(OHV_TRACE_IRQ)) {
         static bool was[64][2];
         unsigned slot = (unsigned)s->id < 64 ? (unsigned)s->id : 0;
         unsigned kind = type == HV_INTERRUPT_TYPE_FIQ ? 0u : 1u;
@@ -2776,7 +2920,7 @@ extern "C" hv_return_t hv_vcpu_invalidate_tlb(hv_vcpu_t id, hv_tlbi_op_t op, uin
  * and a named driver panic, with the whole kext list loaded on the way.
  */
 static unsigned ohv_timer_gate_mode(void) {
-    const char *m = ohv_env("OHV_TIMER_GATE");
+    const char *m = ohv_env(OHV_TIMER_GATE);
     return m ? (unsigned)strtoul(m, nullptr, 0) : 4;
 }
 
@@ -2821,7 +2965,7 @@ static void ohv_note_image_band(VcpuSlot *s) {
     }
     band = pc & ~0xfffffffull;
     if (s->sptm_base == 0 || band < s->sptm_base) {
-        if (ohv_env("OHV_TRACE_BAND")) {
+        if (ohv_env(OHV_TRACE_BAND)) {
             fprintf(stderr, "[ohv] vcpu %llu monitor band %#llx"
                     " (from pc %#llx)\n", (unsigned long long)s->id,
                     (unsigned long long)band, (unsigned long long)pc);
@@ -2998,7 +3142,7 @@ static bool ohv_timer_fiq_wanted(VcpuSlot *s) {
  * Anything not named there keeps the FIQ it has always had.
  */
 static uint64_t ohv_timer_irq_vcpus(void) {
-    const char *m = ohv_env("OHV_TIMER_IRQ_VCPUS");
+    const char *m = ohv_env(OHV_TIMER_IRQ_VCPUS);
     return m ? strtoull(m, nullptr, 0) : 0;
 }
 
@@ -3025,7 +3169,7 @@ static void ohv_set_irq_level(VcpuSlot *s) {
     uint64_t hcr = ohv_rw_controls(s->ctx)->hcr_el2;
     bool timer_irq = ohv_timer_as_irq(s) && ohv_timer_fiq_wanted(s);
     bool want_irq = (s->vmm_irq || timer_irq) &&
-                    (s->sptm_base == 0 || ohv_env("OHV_IRQ_UNGATED") ||
+                    (s->sptm_base == 0 || ohv_env(OHV_IRQ_UNGATED) ||
                      ohv_irq_takeable(s));
     uint64_t want = want_irq ? (1ull << 7) : 0;
 
@@ -3033,7 +3177,7 @@ static void ohv_set_irq_level(VcpuSlot *s) {
      * The one line that says why a level is being withheld.  OHV_TRACE_GATE,
      * capped, because the question is only ever about the first few.
      */
-    if (s->vmm_irq && !want_irq && ohv_env("OHV_TRACE_GATE")) {
+    if (s->vmm_irq && !want_irq && ohv_env(OHV_TRACE_GATE)) {
         {
             /*
              * Every one of them.  A budget hides the edge at the end, which is
@@ -3076,11 +3220,11 @@ static void ohv_set_fiq_level(VcpuSlot *s) {
      * OHV_IPI_UNGATED=1 puts the old behaviour back.
      */
     bool vmm = s->vmm_fiq &&
-               (s->sptm_base == 0 || ohv_env("OHV_IPI_UNGATED") ||
+               (s->sptm_base == 0 || ohv_env(OHV_IPI_UNGATED) ||
                 ohv_fiq_takeable(s));
     uint64_t want = (vmm || s->timer_fiq) ? (1ull << 6) : 0;
 
-    if (s->vmm_fiq && !vmm && ohv_env("OHV_TRACE_GATE")) {
+    if (s->vmm_fiq && !vmm && ohv_env(OHV_TRACE_GATE)) {
         {
             fprintf(stderr, "[ohv] gate vcpu %llu FIQ held: wfx %d mon %d"
                     " pc %#llx cpsr %#x reason %u esr %#llx\n",
@@ -3102,8 +3246,8 @@ static void ohv_set_fiq_level(VcpuSlot *s) {
      * answer.  el2/ger say where the guest is, which is what decides whether
      * gate mode 2 could have held this edge back.
      */
-    if (ohv_env("OHV_TRACE_VF") &&
-        (!ohv_env("OHV_TRACE_VF_K") || g_kernel_running)) {
+    if (ohv_env(OHV_TRACE_VF) &&
+        (!ohv_env(OHV_TRACE_VF_K) || g_kernel_running)) {
         fprintf(stderr, "[ohv] VF %s: pc %#llx mon %#llx cpsr %#x vmm %d"
                 " timer %d el2 %d ger %d p_ctl %#llx p_cval %#llx now %#llx\n",
                 want ? "up  " : "down",
@@ -3204,7 +3348,7 @@ static void ohv_expire_timers(VcpuSlot *s) {
      * still being heavy enough, at one write to stderr per exit, to slow the
      * upload it is printing through to a crawl.
      */
-    if (ohv_env("OHV_TRACE_TIMER") && g_kernel_running) {
+    if (ohv_env(OHV_TRACE_TIMER) && g_kernel_running) {
         uint64_t ctl = s->el2_shadow[OHV_SHADOW_CNTP_CTL];
 
         {
@@ -3277,6 +3421,7 @@ static void ohv_expire_timers(VcpuSlot *s) {
 extern "C" hv_return_t hv_vcpu_run(hv_vcpu_t id) {
     VcpuSlot *s = owned_vcpu(id);
     if (!s) return HV_BAD_ARGUMENT;
+    ohv_cfg_settle();
     /*
      * One call from the caller is as many entries into the guest as the
      * kernel asks for: it returns for things that are its own business, and
@@ -3302,7 +3447,7 @@ extern "C" hv_return_t hv_vcpu_run(hv_vcpu_t id) {
          * address it was given, what it faults on, and whether its early exits
          * look like the first one's.
          */
-        if (ohv_env("OHV_TRACE_FIRSTRUN") &&
+        if (ohv_env(OHV_TRACE_FIRSTRUN) &&
             (ohv_ro(s->ctx)->exit.vmexit_reason == OHV_VMEXIT_HANDLED_FAULT ||
              ohv_ro(s->ctx)->exit.vmexit_reason == OHV_VMEXIT_UNHANDLED_FAULT) &&
             s->kernel_exits++ < 60) {
@@ -3336,7 +3481,7 @@ extern "C" hv_return_t hv_vcpu_run(hv_vcpu_t id) {
          * exit was its own business and re-enter without ever telling the VMM.
          */
         if (s->exit_requested.exchange(false, std::memory_order_acq_rel)) {
-            if (ohv_env("OHV_TRACE_KICK")) {
+            if (ohv_env(OHV_TRACE_KICK)) {
                 fprintf(stderr, "[ohv] vcpu %llu cancel after run at pc %#llx"
                         "\n", (unsigned long long)s->id,
                         (unsigned long long)ohv_rw(s->ctx)->regs.pc);
@@ -3359,7 +3504,7 @@ extern "C" hv_return_t hv_vcpu_run(hv_vcpu_t id) {
          * anything the VMM wanted to inject is injected on the way back.
          */
         if (s->exit_requested.exchange(false, std::memory_order_acq_rel)) {
-            if (ohv_env("OHV_TRACE_KICK")) {
+            if (ohv_env(OHV_TRACE_KICK)) {
                 fprintf(stderr, "[ohv] vcpu %llu cancel honoured at pc %#llx"
                         " hcr %#llx\n", (unsigned long long)s->id,
                         (unsigned long long)ohv_rw(s->ctx)->regs.pc,
@@ -3444,7 +3589,7 @@ static hv_return_t control_field_access(hv_vcpu_t id, _hv_control_field_t f, uin
          * trapped ERET is a guarded return -- believing the guest is guarded
          * before it has ever executed a GENTER.
          */
-        if ((unsigned)f == 9 && !ohv_env("OHV_ALLOW_APSTS_WRITE")) {
+        if ((unsigned)f == 9 && !ohv_env(OHV_ALLOW_APSTS_WRITE)) {
             return HV_SUCCESS;
         }
         *c = *v;
