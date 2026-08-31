@@ -2,7 +2,9 @@
 
 A clean-room C++ rewrite of Hypervisor.framework (arm64 macOS). It links no
 Apple framework; every kernel protocol is implemented through this library's
-own `svc` gate. **Zero entitlement checks in user space.**
+own `svc` gate. **Zero entitlement checks in user space.** 
+
+only tested on 26A5388g.
 
 ## About entitlements
 
